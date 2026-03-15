@@ -619,7 +619,7 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
 # ── Groq call ─────────────────────────────────────────────────────────────────
 async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 1500) -> str:
     client = Groq(api_key=GROQ_KEY)
-    system = SYSTEM + (f"\n\nANALYST CONTEXT:\n{custom}" if custom.strip() else "")
+    system = CIPHER_SYSTEM + (f"\n\nANALYST CONTEXT:\n{custom}" if custom.strip() else "")
     loop = asyncio.get_event_loop()
 
     def _sync_call():
