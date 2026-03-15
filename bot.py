@@ -1644,9 +1644,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Error handler ─────────────────────────────────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Unhandled error:", exc_info=context.error)
+    import traceback
+    tb = "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
+    logger.error(f"Unhandled error:\n{tb}")
     if isinstance(update, Update) and update.message:
-        await update.message.reply_text("Error occurred. Try again. If persistent, use /help.")
+        # Show actual error so we can diagnose — remove after debugging
+        err_msg = f"DEBUG ERROR:\n{type(context.error).__name__}: {str(context.error)[:300]}"
+        await update.message.reply_text(err_msg)
 
 # ── Keep-alive for Render free tier ──────────────────────────────────────────
 from http.server import HTTPServer, BaseHTTPRequestHandler
