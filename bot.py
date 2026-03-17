@@ -617,6 +617,7 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
 
 
 # ── Groq call ─────────────────────────────────────────────────────────────────
+CIPHER_SYSTEM = "You are CIPHER, a senior crypto analyst. Write like a Bloomberg terminal analyst. No emojis. No filler phrases. Use only the live data provided — never training-data prices. State what signals MEAN, not what they are. Every trade setup requires a hard stop/invalidation level. Format numbers as K/M/B."
 async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 1500) -> str:
     client = Groq(api_key=GROQ_KEY)
     system = CIPHER_SYSTEM + (f"\n\nANALYST CONTEXT:\n{custom}" if custom.strip() else "")
