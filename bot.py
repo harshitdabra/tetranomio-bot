@@ -1139,7 +1139,7 @@ async def cmd_cipher(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     if defi_proto:
-        top5 = sorted([p for p in defi_proto if p.get("tvl",0)>0], key=lambda x: x["tvl"], reverse=True)[:5]
+        top5 = sorted([p for p in defi_proto if float(p.get("tvl") or 0)>0], key=lambda x: float(x.get("tvl") or 0), reverse=True)[:5]
         for p in top5:
             ch1d = p.get("change_1d") or 0
             defi_lines.append(f"  {p['name']:20} {fmt(p['tvl']):>10}  1d:{ch1d:+.2f}%")
@@ -1505,8 +1505,8 @@ async def cmd_defi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     if protocols:
-        valid = sorted([p for p in protocols if p.get("tvl",0)>0],
-                       key=lambda x: x["tvl"], reverse=True)[:15]
+        valid = sorted([p for p in protocols if float(p.get("tvl") or 0)>0],
+                       key=lambda x: float(x.get("tvl") or 0), reverse=True)[:15]
         lines.append(f"\n{'PROTOCOL':22} {'TVL':>10}  {'1D':>7}  {'7D':>7}  CHAIN")
         lines.append("─"*62)
         for p in valid:
@@ -1518,8 +1518,8 @@ async def cmd_defi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     if chains:
-        valid_c = sorted([c for c in chains if c.get("tvl",0)>0],
-                         key=lambda x: x["tvl"], reverse=True)[:10]
+        valid_c = sorted([c for c in chains if float(c.get("tvl") or 0)>0],
+                         key=lambda x: float(x.get("tvl") or 0), reverse=True)[:10]
         lines.append(f"\n{'CHAIN':18} {'TVL':>10}")
         lines.append("─"*30)
         for c in valid_c:
