@@ -631,12 +631,15 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
                 total_24h = float(d.get("liquidation_usd_24h", 0) or 0)
                 long_24h  = float(d.get("long_liquidation_usd_24h", 0) or 0)
                 short_24h = float(d.get("short_liquidation_usd_24h", 0) or 0)
-                total_1h  = float(d.get("liquidation_usd_1h", 0) or 0)
-                long_1h   = float(d.get("long_liquidation_usd_1h", 0) or 0)
-                short_1h  = float(d.get("short_liquidation_usd_1h", 0) or 0)
+                total_1h  = float(d.get("liquidation_usd_1h", d.get("liquidationUsd1h", 0)) or 0)
+                long_1h   = float(d.get("long_liquidation_usd_1h", d.get("longLiquidationUsd1h", 0)) or 0)
+                short_1h  = float(d.get("short_liquidation_usd_1h", d.get("shortLiquidationUsd1h", 0)) or 0)
                 lines.append(f"\nLiquidations:")
-                lines.append(f"  24h total: {fmt(total_24h)}  (longs {fmt(long_24h)} / shorts {fmt(short_24h)})")
-                lines.append(f"  1h total:  {fmt(total_1h)}  (longs {fmt(long_1h)} / shorts {fmt(short_1h)})")
+                lines.append(f"  24h: {fmt(total_24h)}  longs {fmt(long_24h)} / shorts {fmt(short_24h)}")
+                if total_1h > 0:
+                    lines.append(f"  1h:  {fmt(total_1h)}  longs {fmt(long_1h)} / shorts {fmt(short_1h)}")
+                else:
+                    lines.append(f"  1h:  {fmt(total_1h)}")
                 dom = ("long-heavy" if long_24h > short_24h * 1.5
                        else "short-heavy" if short_24h > long_24h * 1.5
                        else "balanced")
@@ -671,6 +674,11 @@ BANNED BEHAVIORS:
 - Never use training-data prices. Use ONLY prices in the provided live data.
 - Never fabricate signals. Missing data = write "data unavailable" and stop.
 - Never pad responses. Every sentence must contain new information.
+- NEVER write a MARKET STRUCTURE, ON-CHAIN CONTEXT, or DERIVATIVES section unless that data was explicitly provided in the prompt. If those sections are not in the data, do not include them at all.
+- NEVER invent stablecoin flows, exchange inflows, OI totals, funding rates, NFP numbers, CPI figures, or any specific market statistics not present in the provided data.
+- NEVER include a TRADE SETUP section in /defi, /trending, /etf, /macro, or /fear responses unless explicitly stated in the prompt instructions. Those commands do not produce trade setups.
+- For /macro: never state specific percentage impacts (e.g. -5% to +3%), never invent rate decisions or economic data values. Only describe the mechanism and direction of impact.
+- For dates: always state the current UTC date from the data timestamp. Never reference a date without specifying it explicitly.
 NUMBER FORMAT: Always K/M/B. Never raw integers like 1234567890.
 PRICE FORMAT: Use exact price from live data only.
 
@@ -1044,7 +1052,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*DeFi:*    /defi\n"
         "*Deriv:*   /derivatives  /funding  /oi\n"
         "*Macro:*   /fear  /macro  /etf\n"
-        "*Tools:*   /watchlist  /ask  /setup  /help\n\n"
+        "*Tools:*   /ask  /setup  /help\n\n"
         "Or just type any coin name, ticker, or question.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -1388,7 +1396,8 @@ async def cmd_dominance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
-    gdata, top50 = await asyncio.gather(cg_global(), cg_top50())
+    gdata, top50, btc_deriv = await asyncio.gather(cg_global(), cg_top50(), gl_multi("BTC"))
+    btc_fund, btc_oi, btc_liq, btc_ls = btc_deriv
 
     lines = [f"DOMINANCE & ROTATION | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
     if gdata and "data" in gdata:
@@ -1480,11 +1489,14 @@ async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = (
         "\n".join(lines) + "\n\n"
         "TYPE A — TRENDING REPORT.\n"
-        "CRITICAL: Use ONLY the prices in the live data above. Do NOT use any historical or training-data prices.\n"
+        "Use ONLY the prices in the live data above. Do NOT use any historical prices.\n"
+        "Do NOT write MARKET STRUCTURE, ON-CHAIN CONTEXT, or DERIVATIVES sections.\n"
+        "Do NOT include a TRADE SETUP section.\n"
+        "Write only: NARRATIVE section and ACTION line.\n"
         "Vol/MCap ratio separates organic from retail chasing. State which for each gainer.\n"
-        "Flag any gainer with >30% gain and <$200M MCap — high manipulation probability.\n"
-        "Losers: are strong assets selling off (buy opportunity) or justified exit?\n"
-        "Dominant narrative in one sentence. Is there capital behind it or is it search noise?"
+        "Flag any gainer with >30% gain and <$200M MCap — high manipulation risk.\n"
+        "Losers: are strong assets selling off (opportunity) or justified exit?\n"
+        "Dominant narrative in one sentence. Capital behind it or search noise?"
     )
     result = await ask_groq(prompt, user.get("custom_instructions",""))
     await send(update, result)
@@ -1527,12 +1539,14 @@ async def cmd_defi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prompt = (
         "\n".join(lines) + "\n\n"
-        "TYPE A — DEFI REPORT.\n"
-        "Total TVL direction and implication for DeFi health.\n"
-        "Top 3 gaining TVL: which protocols and why — specific reason if determinable.\n"
-        "Top 3 losing TVL: price effect or genuine capital exit? Different implication.\n"
-        "Chain share shifts: any chain gaining >2% in 7d is a structural signal.\n"
-        "One sentence: where is capital moving in DeFi right now?"
+        "DEFI REPORT — use only the TVL data above.\n"
+        "Do NOT write MARKET STRUCTURE, ON-CHAIN CONTEXT, or DERIVATIVES sections.\n"
+        "Do NOT include a TRADE SETUP section.\n"
+        "Total TVL direction and implication.\n"
+        "Top 3 gaining protocols: which and why.\n"
+        "Top 3 losing protocols: price effect or genuine exit?\n"
+        "Chain share shifts: flag any chain gaining significant share.\n"
+        "ACTION line: one sentence on where capital is moving."
     )
     result = await ask_groq(prompt, user.get("custom_instructions",""))
     await send(update, result)
@@ -1642,15 +1656,34 @@ async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  Vol/MC interpretation: {'elevated — institutional desks active' if vm>8 else 'low — accumulation or disinterest'}")
         lines.append("")
 
-    lines.append("Live ETF flows: sosovalue.org | farside.co.uk")
+    # Add live ETF flow data from API
+    if etf_flows and etf_flows.get("data"):
+        items = etf_flows["data"]
+        if isinstance(items, list) and items:
+            lines.append("\nBTC ETF DAILY FLOWS (live):")
+            for item in items[:7]:
+                try:
+                    date_ts = item.get("date", item.get("time", ""))
+                    if isinstance(date_ts, (int, float)) and date_ts > 1e10:
+                        date_str = datetime.fromtimestamp(date_ts/1000, tz=timezone.utc).strftime("%b %d")
+                    else:
+                        date_str = str(date_ts)[:10]
+                    net = float(item.get("netAssets", item.get("netFlow", item.get("total", 0))) or 0)
+                    lines.append(f"  {date_str}: {fmt(net)} net flow")
+                except Exception:
+                    pass
+    else:
+        lines.append("\nBTC ETF flows: check sosovalue.org | farside.co.uk")
 
     prompt = (
         "\n".join(lines) + "\n\n"
-        "TYPE A — INSTITUTIONAL PROXY REPORT.\n"
-        "Vol/MCap: state exact % and what it implies about institutional desk activity.\n"
-        "ATH distance: contextualise the pain of late-cycle ETF buyers at current price.\n"
-        "Supply issuance: BTC 94%+ mined = structural scarcity. ETH = inflationary/deflationary based on burn.\n"
-        "One-line thesis: are conditions favourable for ETF inflows right now?"
+        "ETF & INSTITUTIONAL REPORT — use only the data above.\n"
+        "Do NOT write ON-CHAIN CONTEXT or DERIVATIVES sections.\n"
+        "Do NOT include a TRADE SETUP section.\n"
+        "If ETF daily flow data is present: state the 7-day trend (net inflow/outflow), total, and what it implies for institutional conviction.\n"
+        "BTC Vol/MCap: state % and activity level (>8% active, <2% accumulation/disinterest).\n"
+        "ATH distance: how much pain are late-cycle buyers in?\n"
+        "One-line verdict: conditions favourable or unfavourable for ETF inflows right now?"
     )
     result = await ask_groq(prompt, user.get("custom_instructions",""))
     await send(update, result)
