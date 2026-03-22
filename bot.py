@@ -447,10 +447,66 @@ async def gl_longshort(symbol: str = "BTC") -> dict | None:
     return None
 
 async def gl_etf_flows() -> dict | None:
-    result = await gl("/etf/bitcoin/flow-history", {"limit": "7"})
+    """
+    /etf/bitcoin/flow-history
+    Fields: timestamp, flow_usd, price_usd, etf_flows:[{etf_ticker, flow_usd}]
+    """
+    result = await gl("/etf/bitcoin/flow-history", {"limit": "10"})
     if result and result.get("data"):
         return result
     logger.warning(f"ETF flows failed: {str(result)[:150]}")
+    return None
+
+async def gl_etf_list() -> dict | None:
+    """
+    /etf/bitcoin/list
+    Fields: ticker, fund_name, fund_type, aum_usd,
+            asset_details:{btc_holding, btc_change_24h, btc_change_7d, btc_change_percent_24h, btc_change_percent_7d}
+    """
+    result = await gl("/etf/bitcoin/list")
+    if result and result.get("data"):
+        return result
+    logger.warning(f"ETF list failed: {str(result)[:150]}")
+    return None
+
+async def gl_btc_dominance() -> dict | None:
+    """
+    /index/bitcoin-dominance
+    Fields: timestamp, price, bitcoin_dominance, market_cap
+    Returns historical list — last item is most recent.
+    """
+    result = await gl("/index/bitcoin-dominance")
+    if result and result.get("data"):
+        return result
+    logger.warning(f"BTC dominance failed: {str(result)[:150]}")
+    return None
+
+async def gl_oi_history(symbol: str = "BTCUSDT", interval: str = "1d", limit: int = 3) -> dict | None:
+    """
+    /futures/open-interest/history
+    Fields: time, open, high, low, close (all OI in USD)
+    """
+    result = await gl("/futures/open-interest/history", {
+        "exchange": "Binance", "symbol": symbol,
+        "interval": interval, "limit": str(limit), "unit": "usd",
+    })
+    if result and result.get("data"):
+        return result
+    logger.warning(f"OI history failed for {symbol}: {str(result)[:150]}")
+    return None
+
+async def gl_funding_history(symbol: str = "BTCUSDT", interval: str = "1d", limit: int = 3) -> dict | None:
+    """
+    /futures/funding-rate/history
+    Fields: time, open, high, low, close (funding rate values)
+    """
+    result = await gl("/futures/funding-rate/history", {
+        "exchange": "Binance", "symbol": symbol,
+        "interval": interval, "limit": str(limit),
+    })
+    if result and result.get("data"):
+        return result
+    logger.warning(f"Funding history failed for {symbol}: {str(result)[:150]}")
     return None
 
 async def gl_multi(symbol: str = "BTC") -> tuple:
@@ -466,10 +522,13 @@ async def gl_debug(symbol: str = "BTC") -> str:
     endpoints = [
         ("/futures/funding-rate/exchange-list",              {"symbol": symbol}),
         ("/futures/open-interest/exchange-list",             {"symbol": symbol}),
-        ("/etf/bitcoin/flow-history",                        {"limit": "3"}),
         ("/futures/liquidation/coin-list",                   {"exchange": "Binance"}),
-        ("/futures/liquidation/exchange-list",               {"symbol": symbol}),
         ("/futures/global-long-short-account-ratio/history", {"exchange": "Binance", "symbol": f"{symbol}USDT", "interval": "4h"}),
+        ("/etf/bitcoin/flow-history",                        {"limit": "3"}),
+        ("/etf/bitcoin/list",                                {}),
+        ("/index/bitcoin-dominance",                         {}),
+        ("/futures/funding-rate/history",                    {"exchange": "Binance", "symbol": f"{symbol}USDT", "interval": "1d", "limit": "2"}),
+        ("/futures/open-interest/history",                   {"exchange": "Binance", "symbol": f"{symbol}USDT", "interval": "1d", "limit": "2"}),
     ]
     lines = [f"API Debug | {symbol} | {datetime.now(timezone.utc).strftime('%H:%M')} UTC"]
     lines.append(f"Base: {GLASS_BASE}")
@@ -547,23 +606,24 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
     # Funding rates — v4: data is a dict with stablecoin_margin_list
     if funding_data and funding_data.get("data"):
         raw = funding_data["data"]
-        # data is a dict {symbol, stablecoin_margin_list, token_margin_list}
-        # or a list — handle both
+        # data is a list of all coins: [{symbol, stablecoin_margin_list}, ...]
+        # Must filter by the correct symbol — never use raw[0]
         if isinstance(raw, list):
-            # list of {symbol, stablecoin_margin_list, ...}
-            raw = raw[0] if raw else {}
+            raw = next((x for x in raw if x.get("symbol","").upper() == symbol.upper()), {})
         exchanges = raw.get("stablecoin_margin_list", [])
         lines.append("\nFunding Rates (per 8h):")
         total, count = 0.0, 0
-        for ex in exchanges[:12]:
+        MAJOR = {"Binance","OKX","Bybit","Bitget","dYdX","Hyperliquid","Gate","MEXC","HTX","Kraken"}
+        for ex in exchanges:
             name = ex.get("exchange", "?")
             rate = ex.get("funding_rate", None)
             if rate is None:
                 continue
             try:
-                r = float(rate) * 100  # convert to percentage
-                total += r
-                count += 1
+                r = float(rate) * 100
+                if name in MAJOR:
+                    total += r
+                    count += 1
                 flag = "  [EXTREME]" if abs(r) > 0.1 else ("  [elevated]" if abs(r) > 0.05 else "")
                 lines.append(f"  {name:14} {r:>+8.4f}%{flag}")
             except (TypeError, ValueError):
@@ -573,7 +633,7 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
             interp = ("CROWDED LONG — longs paying, fade risk" if avg > 0.08
                       else "CROWDED SHORT — squeeze potential" if avg < -0.03
                       else "NEUTRAL — balanced positioning")
-            lines.append(f"  Avg: {avg:>+8.4f}%  →  {interp}")
+            lines.append(f"  Avg (major): {avg:>+8.4f}%  →  {interp}")
         else:
             lines.append("  No exchange data")
     else:
@@ -1316,17 +1376,19 @@ async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if funding and funding.get("data"):
         raw = funding["data"]
         if isinstance(raw, list):
-            raw = raw[0] if raw else {}
+            raw = next((x for x in raw if x.get("symbol","").upper() == gl_sym.upper()), raw[0] if raw else {})
         exchanges = raw.get("stablecoin_margin_list", [])
-        for ex in exchanges[:12]:
+        MAJOR = {"Binance","OKX","Bybit","Bitget","dYdX","Hyperliquid","Gate","MEXC","HTX","Kraken"}
+        for ex in exchanges:
             name = ex.get("exchange", "?")
             rate = ex.get("funding_rate", None)
             if rate is None:
                 continue
             try:
                 r = float(rate) * 100
-                total += r
-                count += 1
+                if name in MAJOR:
+                    total += r
+                    count += 1
                 flag = "  [EXTREME]" if abs(r) > 0.1 else ("  [elevated]" if abs(r) > 0.05 else "")
                 lines.append(f"  {name:14} {r:>+8.4f}%{flag}")
             except Exception:
@@ -1336,7 +1398,7 @@ async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
             interp = ("CROWDED LONG — shorts are cheap hedge" if avg > 0.08 else
                       "CROWDED SHORT — squeeze potential" if avg < -0.03 else
                       "NEUTRAL — no directional bias in funding")
-            lines.append(f"\nAverage:       {avg:>+8.4f}%")
+            lines.append(f"\nAvg (major): {avg:>+8.4f}%")
             lines.append(f"Interpretation: {interp}")
     else:
         lines.append("Funding data unavailable.")
@@ -1396,10 +1458,25 @@ async def cmd_dominance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
-    gdata, top50, btc_deriv = await asyncio.gather(cg_global(), cg_top50(), gl_multi("BTC"))
+    gdata, top50, btc_deriv, dom_data = await asyncio.gather(
+        cg_global(), cg_top50(), gl_multi("BTC"), gl_btc_dominance()
+    )
     btc_fund, btc_oi, btc_liq, btc_ls = btc_deriv
 
     lines = [f"DOMINANCE & ROTATION | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
+    # CoinGlass real-time BTC dominance — confirmed field: bitcoin_dominance
+    if dom_data and dom_data.get("data"):
+        dom_items = dom_data["data"]
+        if isinstance(dom_items, list) and dom_items:
+            latest = dom_items[-1]
+            btc_dom_rt = float(latest.get("bitcoin_dominance", 0) or 0)
+            btc_p_rt   = float(latest.get("price", 0) or 0)
+            total_mc   = float(latest.get("market_cap", 0) or 0)
+            ts = latest.get("timestamp", 0)
+            date_str = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d %H:%M") if ts > 1e10 else "?"
+            lines.append(f"BTC Dominance: {btc_dom_rt:.3f}%  |  BTC: ${btc_p_rt:,.2f}  |  Total MCap: {fmt(total_mc)}")
+            lines.append(f"Updated: {date_str} UTC")
+            lines.append("")
     if gdata and "data" in gdata:
         g = gdata["data"]
         dom = g.get("market_cap_percentage", {})
@@ -1620,70 +1697,92 @@ async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
-    btc_d, eth_d = await asyncio.gather(
+    btc_d, etf_flows, etf_list = await asyncio.gather(
         cg("/coins/bitcoin", {"localization":"false","tickers":"false","market_data":"true",
                               "community_data":"false","developer_data":"false"}),
-        cg("/coins/ethereum", {"localization":"false","tickers":"false","market_data":"true",
-                               "community_data":"false","developer_data":"false"}),
+        gl_etf_flows(),
+        gl_etf_list(),
     )
 
-    lines = [f"INSTITUTIONAL PROXY DATA | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
-    lines.append("Note: direct ETF flow data requires a premium terminal. Below = proxy signals.\n")
+    lines = [f"BTC ETF DATA | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
 
-    for label, d in [("BTC", btc_d), ("ETH", eth_d)]:
-        if not d:
-            lines.append(f"{label}: data unavailable\n")
-            continue
-        md = d.get("market_data", {}) or {}
-        p     = (md.get("current_price") or {}).get("usd", 0)
-        mc    = (md.get("market_cap") or {}).get("usd", 0)
-        vol   = (md.get("total_volume") or {}).get("usd", 0)
-        ath   = (md.get("ath") or {}).get("usd", 0)
-        ath_p = (md.get("ath_change_percentage") or {}).get("usd", 0)
-        ath_d = ((md.get("ath_date") or {}).get("usd") or "?")[:10]
-        circ  = md.get("circulating_supply", 0) or 0
-        maxs  = md.get("max_supply")
-        vm    = (vol / mc * 100) if mc else 0
-        ch24  = md.get("price_change_percentage_24h", 0) or 0
-
-        lines.append(f"{label}:")
-        lines.append(f"  Price:    ${p:,.2f}  24h: {pct(ch24)}")
-        lines.append(f"  MCap:     {fmt(mc)}  |  Vol: {fmt(vol)}  |  Vol/MCap: {vm:.2f}%")
-        lines.append(f"  ATH:      ${ath:,.2f}  on {ath_d}  ({ath_p:.1f}%)")
-        lines.append(f"  Circ:     {circ:,.0f}")
-        if maxs:
-            lines.append(f"  Max:      {maxs:,.0f}  ({circ/maxs*100:.1f}% issued)")
-        lines.append(f"  Vol/MC interpretation: {'elevated — institutional desks active' if vm>8 else 'low — accumulation or disinterest'}")
+    # BTC price context
+    if btc_d:
+        md = btc_d.get("market_data", {}) or {}
+        p    = (md.get("current_price") or {}).get("usd", 0)
+        ch24 = md.get("price_change_percentage_24h", 0) or 0
+        mc   = (md.get("market_cap") or {}).get("usd", 0)
+        vol  = (md.get("total_volume") or {}).get("usd", 0)
+        ath  = (md.get("ath") or {}).get("usd", 0)
+        ath_p= (md.get("ath_change_percentage") or {}).get("usd", 0)
+        vm   = (vol / mc * 100) if mc else 0
+        lines.append(f"BTC: ${p:,.2f}  24h:{pct(ch24)}  MCap:{fmt(mc)}")
+        lines.append(f"Vol/MCap: {vm:.2f}%  |  vs ATH: {ath_p:.1f}%  (ATH ${ath:,.0f})")
         lines.append("")
 
-    # Add live ETF flow data from API
-    if etf_flows and etf_flows.get("data"):
-        items = etf_flows["data"]
-        if isinstance(items, list) and items:
-            lines.append("\nBTC ETF DAILY FLOWS (live):")
-            for item in items[:7]:
+    # ETF holdings list — confirmed: ticker, aum_usd, asset_details.btc_holding
+    if etf_list and etf_list.get("data"):
+        spot = sorted(
+            [x for x in etf_list["data"] if x.get("fund_type") == "Spot"],
+            key=lambda x: float(x.get("aum_usd",0) or 0), reverse=True
+        )
+        if spot:
+            lines.append("BTC SPOT ETF HOLDINGS:")
+            lines.append(f"  {'TICKER':8} {'AUM':>12}  {'BTC HELD':>14}  {'24h BTC':>10}  {'7d BTC':>10}")
+            lines.append("  " + "─"*60)
+            total_btc = 0.0
+            total_aum = 0.0
+            for item in spot[:10]:
                 try:
-                    date_ts = item.get("date", item.get("time", ""))
-                    if isinstance(date_ts, (int, float)) and date_ts > 1e10:
-                        date_str = datetime.fromtimestamp(date_ts/1000, tz=timezone.utc).strftime("%b %d")
-                    else:
-                        date_str = str(date_ts)[:10]
-                    net = float(item.get("netAssets", item.get("netFlow", item.get("total", 0))) or 0)
-                    lines.append(f"  {date_str}: {fmt(net)} net flow")
+                    ticker = item.get("ticker","?")
+                    aum    = float(item.get("aum_usd",0) or 0)
+                    ad     = item.get("asset_details",{}) or {}
+                    btc_h  = float(ad.get("btc_holding",0) or 0)
+                    chg24  = float(ad.get("btc_change_24h",0) or 0)
+                    chg7d  = float(ad.get("btc_change_7d",0) or 0)
+                    total_btc += btc_h
+                    total_aum += aum
+                    lines.append(f"  {ticker:8} {fmt(aum):>12}  {btc_h:>14,.1f}  {chg24:>+10.1f}  {chg7d:>+10.1f}")
                 except Exception:
                     pass
+            lines.append(f"  {'TOTAL':8} {fmt(total_aum):>12}  {total_btc:>14,.1f} BTC")
+        lines.append("")
+
+    # ETF flow history — confirmed: timestamp, flow_usd, price_usd
+    if etf_flows and etf_flows.get("data"):
+        items = etf_flows["data"]
+        try:
+            items = sorted(items, key=lambda x: x.get("timestamp",0), reverse=True)
+        except Exception:
+            pass
+        lines.append("BTC ETF DAILY FLOWS:")
+        total_7d = 0.0
+        for item in items[:7]:
+            try:
+                ts  = item.get("timestamp", 0)
+                date_str = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d") if ts > 1e10 else "?"
+                net = float(item.get("flow_usd", 0) or 0)
+                total_7d += net
+                sign = "+" if net >= 0 else ""
+                label_d = "INFLOW " if net >= 0 else "OUTFLOW"
+                lines.append(f"  {date_str}: {sign}{fmt(abs(net)):>10}  {label_d}")
+            except Exception:
+                pass
+        sign = "+" if total_7d >= 0 else ""
+        lines.append(f"  7-day net: {sign}{fmt(abs(total_7d))}  {'NET INFLOW' if total_7d >= 0 else 'NET OUTFLOW'}")
     else:
-        lines.append("\nBTC ETF flows: check sosovalue.org | farside.co.uk")
+        lines.append("ETF flow data unavailable")
 
     prompt = (
         "\n".join(lines) + "\n\n"
         "ETF & INSTITUTIONAL REPORT — use only the data above.\n"
         "Do NOT write ON-CHAIN CONTEXT or DERIVATIVES sections.\n"
         "Do NOT include a TRADE SETUP section.\n"
-        "If ETF daily flow data is present: state the 7-day trend (net inflow/outflow), total, and what it implies for institutional conviction.\n"
-        "BTC Vol/MCap: state % and activity level (>8% active, <2% accumulation/disinterest).\n"
-        "ATH distance: how much pain are late-cycle buyers in?\n"
-        "One-line verdict: conditions favourable or unfavourable for ETF inflows right now?"
+        "ETF flows: state the 7-day net total and direction (inflow/outflow). What does the trend imply for institutional conviction?\n"
+        "Top holders: which ETF holds the most BTC? Any notable 24h or 7d changes in holdings?\n"
+        "BTC Vol/MCap: state the % and what it implies about institutional desk activity.\n"
+        "ATH distance: how much pain are late-cycle ETF buyers currently in?\n"
+        "One-line verdict: are conditions favourable or unfavourable for ETF inflows right now?"
     )
     result = await ask_groq(prompt, user.get("custom_instructions",""))
     await send(update, result)
