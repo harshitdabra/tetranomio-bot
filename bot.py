@@ -1983,42 +1983,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         err_msg = f"DEBUG ERROR:\n{type(context.error).__name__}: {str(context.error)[:300]}"
         await update.message.reply_text(err_msg)
 
-# ── Keep-alive for Render free tier ──────────────────────────────────────────
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
-
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "")
-
-class PingHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"CIPHER OK")
-    def log_message(self, *args): pass
-
-def _start_keepalive():
-    port = int(os.getenv("PORT", "8080"))
-    threading.Thread(
-        target=lambda: HTTPServer(("0.0.0.0", port), PingHandler).serve_forever(),
-        daemon=True
-    ).start()
-    if RENDER_URL:
-        import urllib.request
-        def _ping():
-            import time
-            time.sleep(60)
-            while True:
-                try:
-                    urllib.request.urlopen(f"{RENDER_URL}/", timeout=10)
-                except Exception:
-                    pass
-                time.sleep(600)
-        threading.Thread(target=_ping, daemon=True).start()
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
-    _start_keepalive()
-
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     setup_conv = ConversationHandler(
