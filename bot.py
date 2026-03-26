@@ -411,28 +411,19 @@ async def gl_oi(symbol: str = "BTC") -> dict | None:
 
 async def gl_liquidations(symbol: str = "BTC") -> dict | None:
     """
-    /futures/liquidation/history
+    /futures/liquidation/aggregated-history
+    Params: exchange_list=Binance, symbol=BTC, interval=1d, limit=3
     Fields: time, long_liquidation_usd, short_liquidation_usd
-    Returns last 3 daily candles for Binance BTCUSDT (or relevant pair).
     """
-    pair_map = {
-        "BTC":"BTCUSDT","ETH":"ETHUSDT","SOL":"SOLUSDT","BNB":"BNBUSDT",
-        "XRP":"XRPUSDT","ADA":"ADAUSDT","AVAX":"AVAXUSDT","LINK":"LINKUSDT",
-        "ARB":"ARBUSDT","OP":"OPUSDT","SEI":"SEIUSDT","INJ":"INJUSDT",
-        "SUI":"SUIUSDT","APT":"APTUSDT","DOGE":"DOGEUSDT","TRX":"TRXUSDT",
-        "NEAR":"NEARUSDT","ATOM":"ATOMUSDT","DOT":"DOTUSDT","PEPE":"PEPEUSDT",
-        "SHIB":"SHIBUSDT","WIF":"WIFUSDT","TAO":"TAOUSDT",
-    }
-    pair = pair_map.get(symbol.upper(), f"{symbol.upper()}USDT")
-    result = await gl("/futures/liquidation/history", {
-        "exchange": "Binance",
-        "symbol": pair,
+    result = await gl("/futures/liquidation/aggregated-history", {
+        "exchange_list": "Binance",
+        "symbol": symbol.upper(),
         "interval": "1d",
         "limit": "3",
     })
     if result and result.get("data"):
         return result
-    logger.warning(f"Liquidation history failed for {symbol} ({pair}): {str(result)[:150]}")
+    logger.warning(f"Liquidation aggregated-history failed for {symbol}: {str(result)[:150]}")
     return None
 
 async def gl_longshort(symbol: str = "BTC") -> dict | None:
@@ -532,7 +523,7 @@ async def gl_debug(symbol: str = "BTC") -> str:
     endpoints = [
         ("/futures/funding-rate/exchange-list",              {"symbol": symbol}),
         ("/futures/open-interest/exchange-list",             {"symbol": symbol}),
-        ("/futures/liquidation/history",                     {"exchange": "Binance", "symbol": "BTCUSDT", "interval": "1d", "limit": "2"}),
+        ("/futures/liquidation/aggregated-history",          {"exchange_list": "Binance", "symbol": "BTC", "interval": "1d", "limit": "2"}),
         ("/futures/global-long-short-account-ratio/history", {"exchange": "Binance", "symbol": f"{symbol}USDT", "interval": "4h"}),
         ("/etf/bitcoin/flow-history",                        {"limit": "3"}),
         ("/etf/bitcoin/list",                                {}),
@@ -691,12 +682,11 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
     else:
         lines.append("\nLong/Short Ratio: unavailable")
 
-    # Liquidations — /liquidation/history fields: time, long_liquidation_usd, short_liquidation_usd
+    # Liquidations — aggregated-history | exchange_list=Binance | interval=1d
     if liq_data and liq_data.get("data"):
         items = liq_data["data"]
         items = items if isinstance(items, list) else []
         if items:
-            # Sort newest first, use most recent candle
             try:
                 items = sorted(items, key=lambda x: x.get("time", 0), reverse=True)
             except Exception:
@@ -707,15 +697,17 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
                 short_usd = float(d.get("short_liquidation_usd", 0) or 0)
                 total_usd = long_usd + short_usd
                 ts = d.get("time", 0)
-                period = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d") if ts > 1e10 else "24h"
-                lines.append(f"\nLiquidations ({period}):")
-                lines.append(f"  Total: {fmt(total_usd)}  |  Longs: {fmt(long_usd)}  |  Shorts: {fmt(short_usd)}")
-                dom = ("long-heavy" if long_usd > short_usd * 1.5
-                       else "short-heavy" if short_usd > long_usd * 1.5
+                date_str = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d") if ts > 1e10 else "?"
+                lines.append(f"\nLiquidations (Binance | 1d | {date_str}):")
+                lines.append(f"  Total:  {fmt(total_usd)}")
+                lines.append(f"  Longs:  {fmt(long_usd)}")
+                lines.append(f"  Shorts: {fmt(short_usd)}")
+                dom = ("long-heavy — longs getting squeezed" if long_usd > short_usd * 1.5
+                       else "short-heavy — shorts getting squeezed" if short_usd > long_usd * 1.5
                        else "balanced")
-                lines.append(f"  Dominant side: {dom}")
+                lines.append(f"  Bias: {dom}")
                 if total_usd > 50_000_000:
-                    lines.append(f"  [ELEVATED] >$50M — cascade risk active")
+                    lines.append(f"  [ELEVATED] >$50M — cascade risk")
             except Exception as e:
                 lines.append(f"\nLiquidations: parse error — {e}")
     else:
@@ -772,7 +764,7 @@ def derivatives_anchor(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
             ratio = float(latest.get("global_account_long_short_ratio", 0) or 0)
             parts.append(f"  Long/Short: {lr:.1f}% long / {sr:.1f}% short (ratio {ratio:.2f}x)")
 
-    # Liquidations — new fields: long_liquidation_usd, short_liquidation_usd
+    # Liquidations — aggregated-history | Binance | 1d
     if liq_data and liq_data.get("data"):
         items = liq_data["data"]
         if isinstance(items, list) and items:
@@ -784,8 +776,10 @@ def derivatives_anchor(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
             long_usd  = float(d.get("long_liquidation_usd", 0) or 0)
             short_usd = float(d.get("short_liquidation_usd", 0) or 0)
             total_usd = long_usd + short_usd
+            ts = d.get("time", 0)
+            date_str = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d") if ts > 1e10 else "?"
             if total_usd:
-                parts.append(f"  Liq: ${total_usd/1e6:.2f}M total (longs ${long_usd/1e6:.2f}M / shorts ${short_usd/1e6:.2f}M)")
+                parts.append(f"  Liq (Binance/1d/{date_str}): ${total_usd/1e6:.2f}M — longs ${long_usd/1e6:.2f}M / shorts ${short_usd/1e6:.2f}M")
 
     parts.append("ANY number not listed above = HALLUCINATION. Do not use it.")
     return "\n".join(parts)
