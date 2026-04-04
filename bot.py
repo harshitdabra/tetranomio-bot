@@ -1973,9 +1973,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     tb = "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__))
     logger.error(f"Unhandled error:\n{tb}")
     if isinstance(update, Update) and update.message:
-        # Show actual error so we can diagnose — remove after debugging
-        err_msg = f"DEBUG ERROR:\n{type(context.error).__name__}: {str(context.error)[:300]}"
-        await update.message.reply_text(err_msg)
+        await update.message.reply_text("Something went wrong. Try again.")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
