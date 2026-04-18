@@ -604,20 +604,21 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
     """
     lines = [f"=== {symbol} DERIVATIVES ==="]
 
-    # Funding rates — v4: data is a dict with stablecoin_margin_list
+    # Funding rates — v4: data may be dict with stablecoin_margin_list, or list of exchange objects
     if funding_data and funding_data.get("data"):
         raw = funding_data["data"]
-        # data is a list of all coins: [{symbol, stablecoin_margin_list}, ...]
-        # Must filter by the correct symbol — never use raw[0]
-        if isinstance(raw, list):
-            raw = next((x for x in raw if x.get("symbol","").upper() == symbol.upper()), {})
-        exchanges = raw.get("stablecoin_margin_list", [])
+        # Case A: list of coin objects [{symbol, stablecoin_margin_list}, ...]
+        if isinstance(raw, list) and raw and isinstance(raw[0], dict) and ("stablecoin_margin_list" in raw[0] or "symbol" in raw[0]):
+            raw = next((x for x in raw if x.get("symbol","").upper() == symbol.upper()), raw[0] if raw else {})
+        # Case B: already a dict for one coin
+        exchanges = (raw.get("stablecoin_margin_list") or raw.get("usdtMarginList") or
+                     (raw if isinstance(raw, list) else []))
         lines.append("\nFunding Rates (per 8h):")
         total, count = 0.0, 0
         MAJOR = {"Binance","OKX","Bybit","Bitget","dYdX","Hyperliquid","Gate","MEXC","HTX","Kraken"}
         for ex in exchanges:
-            name = ex.get("exchange", "?")
-            rate = ex.get("funding_rate", None)
+            name = ex.get("exchangeName") or ex.get("exchange") or "?"
+            rate = ex.get("fundingRate") if ex.get("fundingRate") is not None else ex.get("funding_rate")
             if rate is None:
                 continue
             try:
@@ -640,38 +641,46 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
     else:
         lines.append("\nFunding Rates: unavailable")
 
-    # Open Interest — v4: list of exchange objects, first item is "All" aggregate
+    # Open Interest — v4: list of exchange objects; aggregate row has exchangeName=="All"
     if oi_data and oi_data.get("data"):
         items = oi_data["data"]
         items = items if isinstance(items, list) else [items]
-        # First item is aggregate "All"
-        agg = next((x for x in items if x.get("exchange") == "All"), items[0] if items else {})
-        total_oi = float(agg.get("open_interest_usd", 0) or 0)
-        ch1h = float(agg.get("open_interest_change_percent_1h", 0) or 0)
-        ch4h = float(agg.get("open_interest_change_percent_4h", 0) or 0)
-        ch24h = float(agg.get("open_interest_change_percent_24h", 0) or 0)
+        def _ex_name(x): return x.get("exchangeName") or x.get("exchange") or ""
+        agg = next((x for x in items if _ex_name(x) == "All"), items[0] if items else {})
+        total_oi = float(agg.get("openInterestUsd") or agg.get("open_interest_usd") or 0)
+        ch1h  = float(agg.get("h1OIChangePercent") or agg.get("open_interest_change_percent_1h") or 0)
+        ch4h  = float(agg.get("h4OIChangePercent") or agg.get("open_interest_change_percent_4h") or 0)
+        ch24h = float(agg.get("h24Change") or agg.get("oichangePercent") or agg.get("open_interest_change_percent_24h") or 0)
         lines.append(f"\nOpen Interest: {fmt(total_oi)}")
         lines.append(f"  Change: 1h {ch1h:+.2f}%  4h {ch4h:+.2f}%  24h {ch24h:+.2f}%")
-        # Per-exchange breakdown
-        per_ex = [x for x in items if x.get("exchange") != "All"]
+        per_ex = [x for x in items if _ex_name(x) != "All"]
         for x in per_ex[:6]:
-            ex  = x.get("exchange", "?")
-            oi  = float(x.get("open_interest_usd", 0) or 0)
+            ex  = _ex_name(x) or "?"
+            oi  = float(x.get("openInterestUsd") or x.get("open_interest_usd") or 0)
             share = (oi / total_oi * 100) if total_oi else 0
             lines.append(f"  {ex:16} {fmt(oi):>12}  ({share:.1f}%)")
     else:
         lines.append("\nOpen Interest: unavailable")
 
-    # Long/Short ratio — v4: global_account_long_percent already in %
+    # Long/Short ratio — v4: longRatio/shortRatio may be 0-1 or 0-100
     if ls_data and ls_data.get("data"):
         items = ls_data["data"]
         items = items if isinstance(items, list) else []
         if items:
             latest = items[-1]
             try:
-                lr    = float(latest.get("global_account_long_percent", 0) or 0)
-                sr    = float(latest.get("global_account_short_percent", 0) or 0)
-                ratio = float(latest.get("global_account_long_short_ratio", 0) or 0)
+                lr = float(latest.get("longRatio") or latest.get("long_ratio") or
+                           latest.get("global_account_long_percent") or 0)
+                sr = float(latest.get("shortRatio") or latest.get("short_ratio") or
+                           latest.get("global_account_short_percent") or 0)
+                ratio = float(latest.get("longShortRatio") or latest.get("long_short_ratio") or
+                              latest.get("global_account_long_short_ratio") or 0)
+                # Normalize: if values are 0-1 range, convert to percentage
+                if lr < 2:
+                    lr *= 100
+                    sr *= 100
+                if not ratio and sr:
+                    ratio = lr / sr
                 interp = ("Majority long — crowded, downside risk" if lr > 60
                           else "Majority short — upside squeeze potential" if lr < 40
                           else "Balanced positioning")
@@ -688,16 +697,24 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
         items = items if isinstance(items, list) else []
         if items:
             try:
-                items = sorted(items, key=lambda x: x.get("time", 0), reverse=True)
+                ts_key = "timestamp" if "timestamp" in items[0] else "time"
+                items = sorted(items, key=lambda x: x.get(ts_key, 0), reverse=True)
             except Exception:
                 pass
             d = items[0]
             try:
-                long_usd  = float(d.get("long_liquidation_usd", 0) or 0)
-                short_usd = float(d.get("short_liquidation_usd", 0) or 0)
+                long_usd  = float(d.get("aggregatedLongUsd") or d.get("long_liquidation_usd") or
+                                  d.get("long") or 0)
+                short_usd = float(d.get("aggregatedShortUsd") or d.get("short_liquidation_usd") or
+                                  d.get("short") or 0)
                 total_usd = long_usd + short_usd
-                ts = d.get("time", 0)
-                date_str = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d") if ts > 1e10 else "?"
+                ts = d.get("timestamp") or d.get("time") or 0
+                if ts > 1e10:
+                    date_str = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d")
+                elif ts > 0:
+                    date_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d")
+                else:
+                    date_str = "?"
                 lines.append(f"\nLiquidations (Binance | 1d | {date_str}):")
                 lines.append(f"  Total:  {fmt(total_usd)}")
                 lines.append(f"  Longs:  {fmt(long_usd)}")
@@ -725,14 +742,15 @@ def derivatives_anchor(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
     # Funding avg from major exchanges
     if funding_data and funding_data.get("data"):
         raw = funding_data["data"]
-        if isinstance(raw, list):
-            raw = next((x for x in raw if x.get("symbol","").upper() == symbol.upper()), {})
-        exchanges = raw.get("stablecoin_margin_list", [])
+        if isinstance(raw, list) and raw and isinstance(raw[0], dict) and ("stablecoin_margin_list" in raw[0] or "symbol" in raw[0]):
+            raw = next((x for x in raw if x.get("symbol","").upper() == symbol.upper()), raw[0] if raw else {})
+        exchanges = (raw.get("stablecoin_margin_list") or raw.get("usdtMarginList") or
+                     (raw if isinstance(raw, list) else []))
         MAJOR = {"Binance","OKX","Bybit","Bitget","dYdX","Hyperliquid","Gate","MEXC","HTX","Kraken"}
         total, count = 0.0, 0
         for ex in exchanges:
-            name = ex.get("exchange","?")
-            rate = ex.get("funding_rate", None)
+            name = ex.get("exchangeName") or ex.get("exchange") or "?"
+            rate = ex.get("fundingRate") if ex.get("fundingRate") is not None else ex.get("funding_rate")
             if rate is None: continue
             try:
                 r = float(rate) * 100
@@ -748,9 +766,10 @@ def derivatives_anchor(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
     # OI total
     if oi_data and oi_data.get("data"):
         items = oi_data["data"] if isinstance(oi_data["data"], list) else [oi_data["data"]]
-        agg = next((x for x in items if x.get("exchange") == "All"), items[0] if items else {})
-        total_oi = float(agg.get("open_interest_usd", 0) or 0)
-        ch24 = float(agg.get("open_interest_change_percent_24h", 0) or 0)
+        def _ex_name(x): return x.get("exchangeName") or x.get("exchange") or ""
+        agg = next((x for x in items if _ex_name(x) == "All"), items[0] if items else {})
+        total_oi = float(agg.get("openInterestUsd") or agg.get("open_interest_usd") or 0)
+        ch24 = float(agg.get("h24Change") or agg.get("oichangePercent") or agg.get("open_interest_change_percent_24h") or 0)
         if total_oi:
             parts.append(f"  OI total: ${total_oi/1e9:.2f}B  (24h change: {ch24:+.2f}%)")
 
@@ -759,9 +778,17 @@ def derivatives_anchor(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
         items = ls_data["data"]
         if isinstance(items, list) and items:
             latest = items[-1]
-            lr = float(latest.get("global_account_long_percent", 0) or 0)
-            sr = float(latest.get("global_account_short_percent", 0) or 0)
-            ratio = float(latest.get("global_account_long_short_ratio", 0) or 0)
+            lr = float(latest.get("longRatio") or latest.get("long_ratio") or
+                       latest.get("global_account_long_percent") or 0)
+            sr = float(latest.get("shortRatio") or latest.get("short_ratio") or
+                       latest.get("global_account_short_percent") or 0)
+            ratio = float(latest.get("longShortRatio") or latest.get("long_short_ratio") or
+                          latest.get("global_account_long_short_ratio") or 0)
+            if lr < 2:
+                lr *= 100
+                sr *= 100
+            if not ratio and sr:
+                ratio = lr / sr
             parts.append(f"  Long/Short: {lr:.1f}% long / {sr:.1f}% short (ratio {ratio:.2f}x)")
 
     # Liquidations — aggregated-history | Binance | 1d
@@ -769,120 +796,137 @@ def derivatives_anchor(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
         items = liq_data["data"]
         if isinstance(items, list) and items:
             try:
-                items = sorted(items, key=lambda x: x.get("time", 0), reverse=True)
+                ts_key = "timestamp" if "timestamp" in items[0] else "time"
+                items = sorted(items, key=lambda x: x.get(ts_key, 0), reverse=True)
             except Exception:
                 pass
             d = items[0]
-            long_usd  = float(d.get("long_liquidation_usd", 0) or 0)
-            short_usd = float(d.get("short_liquidation_usd", 0) or 0)
+            long_usd  = float(d.get("aggregatedLongUsd") or d.get("long_liquidation_usd") or d.get("long") or 0)
+            short_usd = float(d.get("aggregatedShortUsd") or d.get("short_liquidation_usd") or d.get("short") or 0)
             total_usd = long_usd + short_usd
-            ts = d.get("time", 0)
-            date_str = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d") if ts > 1e10 else "?"
+            ts = d.get("timestamp") or d.get("time") or 0
+            if ts > 1e10:
+                date_str = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d")
+            elif ts > 0:
+                date_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d")
+            else:
+                date_str = "?"
             if total_usd:
                 parts.append(f"  Liq (Binance/1d/{date_str}): ${total_usd/1e6:.2f}M — longs ${long_usd/1e6:.2f}M / shorts ${short_usd/1e6:.2f}M")
 
     parts.append("ANY number not listed above = HALLUCINATION. Do not use it.")
     return "\n".join(parts)
 CIPHER_SYSTEM = """IDENTITY
-You are CIPHER — senior crypto on-chain analyst and derivatives strategist.
-You produce the quality of a Delphi Digital brief or Nansen alpha report: concise, data-anchored, and immediately actionable.
+You are CIPHER — senior digital assets analyst at a tier-1 institutional desk (BlackRock / Goldman Sachs / Fidelity caliber).
+You write at the standard of a morning markets brief distributed to portfolio managers and CIOs before open.
+Every output must be immediately actionable: a PM reading your response should know exactly what to do with their book.
+
+ANALYTICAL FRAMEWORK — ALWAYS APPLY IN THIS ORDER:
+1. MACRO REGIME: Fed posture → DXY → risk premium → crypto beta. This is the governing layer.
+2. INSTITUTIONAL FLOWS: ETF inflows/outflows, on-chain exchange flows, stablecoin supply. Capital is the signal.
+3. DERIVATIVES STRUCTURE: Funding rate, OI, long/short ratio. Market positioning reveals conviction or crowding.
+4. PRICE + MOMENTUM: Only after 1-3 above. Price confirms structure; it does not create it.
 
 CORE MISSION
-Every response must do one of these:
-1. State what a signal MEANS (not what it is)
-2. State what to DO (specific action with levels)
-3. State what to WATCH (specific trigger that changes the thesis)
+Every response must deliver exactly one of:
+1. What a signal MEANS for risk-adjusted returns — not what it is
+2. What to DO — specific allocation action with precise levels
+3. What to WATCH — the specific trigger that invalidates or confirms the thesis
 If your response does none of these three, rewrite it.
 
 ABSOLUTE OUTPUT RULES:
-BANNED PHRASES: it is worth noting | this suggests | this indicates | potentially | may indicate | could be | one might | in conclusion | to summarize | it is important | it remains to be seen | overall | essentially | notably | importantly | interestingly | looking at | in terms of | delve | landscape | ecosystem | robust | seamless | market participants | strong fundamentals | weak fundamentals | bullish outlook | bearish sentiment | at the end of the day
+BANNED PHRASES: it is worth noting | this suggests | this indicates | potentially | may indicate | could be | one might | in conclusion | to summarize | it is important | it remains to be seen | overall | essentially | notably | importantly | interestingly | looking at | in terms of | delve | landscape | ecosystem | robust | seamless | market participants | strong fundamentals | weak fundamentals | bullish outlook | bearish sentiment | at the end of the day | crypto winter | moon | to the moon | WAGMI | ape in | degen | diamond hands | paper hands
 BANNED BEHAVIORS:
-- Zero emojis
-- Never describe data. Only interpret it.
-- Never use training-data prices. Use ONLY prices in the provided live data.
-- Never fabricate signals. Missing data = write "data unavailable" and stop.
-- Never pad responses. Every sentence must contain new information.
-- NEVER write a MARKET STRUCTURE, ON-CHAIN CONTEXT, or DERIVATIVES section unless that data was explicitly provided in the prompt. If those sections are not in the data, do not include them at all.
-- NEVER invent stablecoin flows, exchange inflows, OI totals, funding rates, NFP numbers, CPI figures, or any specific market statistics not present in the provided data.
-- NEVER include a TRADE SETUP section in /defi, /trending, /etf, /macro, or /fear responses unless explicitly stated in the prompt instructions. Those commands do not produce trade setups.
-- For /macro: never state specific percentage impacts (e.g. -5% to +3%), never invent rate decisions or economic data values. Only describe the mechanism and direction of impact.
-- For dates: always state the current UTC date from the data timestamp. Never reference a date without specifying it explicitly.
-NUMBER FORMAT: Always K/M/B. Never raw integers like 1234567890.
-PRICE FORMAT: Use exact price from live data only.
+- Zero emojis. Zero exclamation marks.
+- Never describe data. Only interpret it with a risk/return lens.
+- Never use training-data prices. Use ONLY the exact prices in the provided live data.
+- Never fabricate signals. Missing data = write "data unavailable" and stop that section.
+- Never pad responses. Every sentence must carry new analytical content.
+- NEVER write a MACRO REGIME, DERIVATIVES, or ON-CHAIN section unless that specific data was provided in the prompt.
+- NEVER invent CPI figures, NFP numbers, Fed rate decisions, OI totals, funding rates, stablecoin supply figures, or any statistics not present in the provided data.
+- NEVER include a POSITION RECOMMENDATION section in /defi, /trending, /etf, /macro, or /fear responses unless explicitly instructed.
+- For /macro: never state specific percentage impact ranges. Describe the mechanism and direction only.
+- For dates: always state the explicit UTC date from the data timestamp. Never reference "today" without the date.
+NUMBER FORMAT: Always K/M/B notation. Never raw integers.
+PRICE FORMAT: Use exact price from live data only. Never round to approximate values.
+SIZING LANGUAGE: Use institutional sizing language — "25% initial allocation", "add 15% at $X", "reduce notional by 30%", not "buy a bit" or "scale in slowly".
 
 INTENT CLASSIFICATION — ALWAYS DO THIS FIRST:
 TYPE A — MARKET REPORT: /cipher /btc /fear /defi + general market questions
-TYPE B — COIN QUESTION: any ticker or coin name question
-TYPE C — POSITION QUESTION: scale in / DCA / take profit / add / reduce
-TYPE D — CONCEPT: explain CVD / funding rates / liquidations etc
-TYPE E — ALERT SCAN: any alerts / anything unusual
-TYPE F — COMPARISON: X vs Y / which is better
-TYPE G — PORTFOLIO: watchlist analysis / multi-coin review
+TYPE B — COIN ANALYSIS: any ticker or coin name question
+TYPE C — POSITION/ALLOCATION: add / reduce / DCA / take profit / sizing questions
+TYPE D — CONCEPT: explain funding rates / OI / liquidations / on-chain metrics
+TYPE E — ALERT SCAN: anything unusual / any alerts / risk scan
+TYPE F — COMPARISON: X vs Y / relative value / which has stronger setup
+TYPE G — PORTFOLIO REVIEW: watchlist / multi-asset allocation review
 
 RESPONSE FORMATS:
 
 TYPE A — MARKET REPORT:
+MACRO REGIME
+[Current risk-on / risk-off / transitional. Fed posture. DXY trend. Equity correlation signal. One number anchors this.]
 MARKET STRUCTURE
-[Price + key level above and below. Support/resistance/no-man's land. Exact numbers.]
-ON-CHAIN CONTEXT
-[Stablecoin supply trend + implication. Exchange flow proxy. Institutional activity signal.]
+[Total MC + 24h change. BTC/ETH price vs key levels. No-man's land or at structure. Exact numbers only.]
+INSTITUTIONAL FLOWS
+[Stablecoin supply direction + implication. ETF flow if available. Dry powder estimate.]
 DERIVATIVES
-[Funding rate avg + bias. OI total + direction. Long/short ratio + crowding risk. Liquidation context.]
-NARRATIVE
-[What has real volume. What retail is chasing. Dominant sector or catalyst.]
+[Funding rate avg + bias interpretation. OI total + direction. Long/short ratio + crowding risk.]
 SIGNAL SYNTHESIS
 Bias: BULLISH / BEARISH / NEUTRAL | Confidence: HIGH / MEDIUM / LOW
-Driver: [one specific reason with a number]
-Invalidation: [specific price or event]
-TRADE SETUP [only if 2+ signals agree — skip if not]
-Asset | Direction | Entry | Stop | T1 | T2 | Conviction: H/M/L
-Thesis: [2 sentences, numbers only]
-ACTION: [trade / add / reduce / flat / wait] — [one-line reason]
+Primary driver: [one specific number from the data]
+Invalidation level: [specific price or macro event]
+POSITION RECOMMENDATION [only if 2+ signals converge — omit if not]
+Asset | Direction | Entry zone | Stop | Target 1 | Target 2 | Conviction: H/M/L
+Thesis: [2 sentences, numbers only, no adjectives]
+ALLOCATION ACTION: [add exposure / reduce notional / hold / avoid / wait for level] — [one-line reason with a number]
 
-TYPE B — COIN BRIEF:
-[COIN] BRIEF | [live price]
-PRICE STRUCTURE: [vs 24h range, vs ATH, key level above and below]
-MOMENTUM: [1h/24h/7d trend. vs BTC relative performance]
-VOLUME QUALITY: [Vol/MCap ratio. Expanding or contracting with move]
-DERIVATIVES: [Funding rate. OI direction. Long/short ratio if available]
-VERDICT: SCALE IN / WAIT FOR LEVEL $X / AVOID / REDUCE
-[If actionable: entry zone, stop, target]
+TYPE B — COIN ANALYSIS:
+[COIN] | [live price] | [date UTC]
+PRICE STRUCTURE: [vs 24h range. vs ATH drawdown %. Key level above and below with exact prices.]
+MOMENTUM: [1h/24h/7d performance. vs BTC relative performance in percentage points.]
+VOLUME QUALITY: [Vol/MCap ratio. Is volume confirming the move or diverging?]
+RISK/REWARD: [Upside to next resistance vs downside to next support. Express as X:1 ratio.]
+DERIVATIVES: [Funding rate — exact number. OI direction. Long/short crowding. If unavailable, state so.]
+ALLOCATION VERDICT: BUILD POSITION / ACCUMULATE AT $X / HOLD / REDUCE NOTIONAL / AVOID
+[If actionable: entry zone, hard stop, target. Sizing: X% initial, Y% on confirmation.]
 
-TYPE C — POSITION BRIEF:
-POSITION ASSESSMENT | [asset] @ [live price]
-STRUCTURE: [Price vs key levels. High/mid/low risk zone]
-DOWNSIDE: [Next major support and % drawdown if wrong]
-MARKET ALIGNMENT: [Does macro + derivatives support adding risk? YES/NO + reason]
-RECOMMENDATION: SCALE IN NOW / SCALE IN AT $X / HOLD / REDUCE X% / EXIT
-Sizing: [e.g. 25% now, 25% at support, 50% dry]
-Stop: $[X] — hard invalidation
+TYPE C — ALLOCATION BRIEF:
+POSITION ASSESSMENT | [asset] @ [live price] | [date UTC]
+STRUCTURE: [Price vs key levels. High/mid/low risk zone for entry.]
+DRAWDOWN SCENARIO: [Next major support and exact % drawdown if thesis fails.]
+PORTFOLIO RISK: [Estimated % of portfolio at risk at stated position size.]
+MARKET ALIGNMENT: [Does macro + derivatives support adding exposure? YES/NO + specific reason.]
+RECOMMENDATION: ADD EXPOSURE NOW / ACCUMULATE AT $X / HOLD / REDUCE 30% / EXIT
+Sizing: [e.g. 20% initial, 20% at $X support, 60% dry powder]
+Hard stop: $[X] — position invalidated below this level
 
 TYPE D — CONCEPT:
-[3-5 sentences. Direct answer.]
-Trading implication: [one sentence on practical use.]
+[3-5 sentences. Direct, precise answer.]
+Institutional application: [one sentence on how this metric is used by a professional desk.]
 
-TYPE E — ALERTS:
-[RED / AMBER / INFO] | [asset] | [condition] | [implication]
-Only triggered conditions. If nothing: "No active alerts."
+TYPE E — ALERT SCAN:
+[RED / AMBER / INFO] | [asset] | [condition with exact number] | [risk implication]
+Only triggered conditions. If nothing: "No active risk alerts across monitored assets."
 
-TYPE F — COMPARISON:
-[A] vs [B]
-Relative performance: [exact numbers]
-Momentum differential: [which is stronger]
-Volume quality: [which has better Vol/MCap conviction]
-Derivatives edge: [which has cleaner structure]
-Verdict: [one sentence — which has stronger setup and why]
+TYPE F — RELATIVE VALUE:
+[A] vs [B] | [date UTC]
+Relative performance: [exact numbers — 24h and 7d differential in percentage points]
+Momentum differential: [which has accelerating momentum and by how much]
+Volume conviction: [Vol/MCap comparison — which has institutional-grade volume quality]
+Derivatives edge: [which has cleaner funding/OI structure]
+Risk/reward differential: [which offers better R/R at current levels]
+Allocation verdict: [one sentence — which has superior risk-adjusted setup and the specific reason]
 
-TYPE G — PORTFOLIO:
-For each coin: [COIN]: [bias] | Key level: $X | Action: hold/add at $X/reduce
-Summary: [overall portfolio risk — 2 sentences]
+TYPE G — PORTFOLIO REVIEW:
+For each asset: [COIN] @ $[price] | Bias: [BULLISH/NEUTRAL/BEARISH] | Key level: $X | Allocation: hold/add X% at $Y/reduce Z%
+Portfolio summary: [overall risk posture — 2 sentences. Concentration risk. Macro alignment.]
 
 SIGNAL HIERARCHY:
-PRIMARY (form bias): Funding rate | OI trend | Long/short ratio | Liquidation cascade | Stablecoin supply
-CONFIRMING: Vol/MCap ratio | BTC dominance | Fear & Greed extremes | DeFi TVL
-NEVER PRIMARY: RSI | MACD | Bollinger Bands | MAs standalone | Fear & Greed alone
+PRIMARY (drives bias): Funding rate trend | OI change direction | Long/short crowding | Liquidation cascade | Stablecoin supply growth
+CONFIRMING (supports thesis): Vol/MCap ratio | ETF inflow/outflow | BTC dominance inflection | DeFi TVL
+SENTIMENT (context only, never primary): Fear & Greed Index | social volume | search trends
 
-STYLE: Bloomberg terminal analyst. Active voice. Short sentences. Every sentence = new information. No claim without a number."""
+STYLE: Tier-1 institutional morning brief. Bloomberg terminal density. Active voice. Short declarative sentences. Every sentence adds new analytical content. No sentence without a number. No claim without a cited data point. No adjectives that are not quantified."""
 
 # ── Groq call ─────────────────────────────────────────────────────────────────
 async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 1500) -> str:
@@ -1187,30 +1231,31 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "*CIPHER — All Commands*\n\n"
-        "*Market Intelligence*\n"
-        "`/cipher` — Full cycle report: market + derivatives + macro + setup\n"
-        "`/btc` — BTC deep dive: all timeframes + full derivatives\n"
-        "`/dominance` — BTC/ETH dominance + rotation signals\n"
-        "`/trending` — Trending coins + gainers/losers + vol quality\n\n"
+        "*CIPHER — Institutional Market Intelligence*\n\n"
+        "*Market Reports*\n"
+        "`/cipher` — Full cycle: macro regime + market + derivatives + allocation signal\n"
+        "`/btc` — BTC institutional brief: all timeframes + full derivatives\n"
+        "`/dominance` — BTC/ETH dominance + capital rotation analysis\n"
+        "`/trending` — Trending + gainers/losers + volume conviction\n\n"
         "*DeFi*\n"
         "`/defi` — DeFi TVL by protocol + chain (live)\n\n"
         "*Derivatives*\n"
         "`/derivatives [coin]` — Funding + OI + long/short + liquidations\n"
         "`/funding [coin]` — Funding rates across all exchanges\n"
-        "`/oi [coin]` — Open interest breakdown\n\n"
+        "`/oi [coin]` — Open interest breakdown by exchange\n\n"
         "*Macro & Sentiment*\n"
-        "`/fear` — Fear & Greed + stablecoin supply + live prices\n"
-        "`/etf` — Institutional proxy data\n"
-        "`/macro` — High-impact event calendar\n\n"
-        "*Personal*\n"
-        "`/watchlist add chainlink` — Add coin\n"
+        "`/fear` — Fear & Greed + stablecoin supply analysis\n"
+        "`/etf` — Institutional ETF flow + holdings data\n"
+        "`/macro` — Macro regime + event calendar\n\n"
+        "*Portfolio*\n"
+        "`/watchlist` — Analyze your watchlist\n"
+        "`/watchlist add chainlink` — Add coin to watchlist\n"
         "`/watchlist remove chainlink` — Remove coin\n"
         "`/ask [question]` — Any question with live data\n"
         "`/setup` — Custom analyst profile\n\n"
         "*Free-text works for everything:*\n"
-        "`what about tao`  `should I scale sei`  `is link breaking out`\n"
-        "`compare sol vs avax`  `explain funding rates`  `any alerts`",
+        "`what about TAO`  `should I add to SOL`  `is LINK breaking out`\n"
+        "`compare SOL vs AVAX`  `explain funding rates`  `any risk alerts`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -1439,13 +1484,14 @@ async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total, count = 0, 0
     if funding and funding.get("data"):
         raw = funding["data"]
-        if isinstance(raw, list):
+        if isinstance(raw, list) and raw and isinstance(raw[0], dict) and ("stablecoin_margin_list" in raw[0] or "symbol" in raw[0]):
             raw = next((x for x in raw if x.get("symbol","").upper() == gl_sym.upper()), raw[0] if raw else {})
-        exchanges = raw.get("stablecoin_margin_list", [])
+        exchanges = (raw.get("stablecoin_margin_list") or raw.get("usdtMarginList") or
+                     (raw if isinstance(raw, list) else []))
         MAJOR = {"Binance","OKX","Bybit","Bitget","dYdX","Hyperliquid","Gate","MEXC","HTX","Kraken"}
         for ex in exchanges:
-            name = ex.get("exchange", "?")
-            rate = ex.get("funding_rate", None)
+            name = ex.get("exchangeName") or ex.get("exchange") or "?"
+            rate = ex.get("fundingRate") if ex.get("fundingRate") is not None else ex.get("funding_rate")
             if rate is None:
                 continue
             try:
@@ -1491,17 +1537,18 @@ async def cmd_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if oi_data and oi_data.get("data"):
         items = oi_data["data"]
         items = items if isinstance(items, list) else [items]
-        agg = next((x for x in items if x.get("exchange") == "All"), items[0] if items else {})
-        total_oi = float(agg.get("open_interest_usd", 0) or 0)
-        ch1h  = float(agg.get("open_interest_change_percent_1h", 0) or 0)
-        ch4h  = float(agg.get("open_interest_change_percent_4h", 0) or 0)
-        ch24h = float(agg.get("open_interest_change_percent_24h", 0) or 0)
+        def _ex_name_oi(x): return x.get("exchangeName") or x.get("exchange") or ""
+        agg = next((x for x in items if _ex_name_oi(x) == "All"), items[0] if items else {})
+        total_oi = float(agg.get("openInterestUsd") or agg.get("open_interest_usd") or 0)
+        ch1h  = float(agg.get("h1OIChangePercent") or agg.get("open_interest_change_percent_1h") or 0)
+        ch4h  = float(agg.get("h4OIChangePercent") or agg.get("open_interest_change_percent_4h") or 0)
+        ch24h = float(agg.get("h24Change") or agg.get("oichangePercent") or agg.get("open_interest_change_percent_24h") or 0)
         lines.append(f"Total OI: {fmt(total_oi)}")
         lines.append(f"Change: 1h {ch1h:+.2f}%  4h {ch4h:+.2f}%  24h {ch24h:+.2f}%\n")
-        per_ex = [x for x in items if x.get("exchange") != "All"]
+        per_ex = [x for x in items if _ex_name_oi(x) != "All"]
         for x in per_ex[:10]:
-            ex  = x.get("exchange", "?")
-            oi  = float(x.get("open_interest_usd", 0) or 0)
+            ex  = _ex_name_oi(x) or "?"
+            oi  = float(x.get("openInterestUsd") or x.get("open_interest_usd") or 0)
             share = (oi / total_oi * 100) if total_oi else 0
             lines.append(f"  {ex:16} OI: {fmt(oi):>12}  ({share:.1f}% share)")
     else:
@@ -1528,16 +1575,21 @@ async def cmd_dominance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     btc_fund, btc_oi, btc_liq, btc_ls = btc_deriv
 
     lines = [f"DOMINANCE & ROTATION | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
-    # CoinGlass real-time BTC dominance — confirmed field: bitcoin_dominance
+    # CoinGlass real-time BTC dominance — v4 fields: btcDominance or bitcoin_dominance
     if dom_data and dom_data.get("data"):
         dom_items = dom_data["data"]
         if isinstance(dom_items, list) and dom_items:
             latest = dom_items[-1]
-            btc_dom_rt = float(latest.get("bitcoin_dominance", 0) or 0)
-            btc_p_rt   = float(latest.get("price", 0) or 0)
-            total_mc   = float(latest.get("market_cap", 0) or 0)
-            ts = latest.get("timestamp", 0)
-            date_str = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d %H:%M") if ts > 1e10 else "?"
+            btc_dom_rt = float(latest.get("btcDominance") or latest.get("bitcoin_dominance") or 0)
+            btc_p_rt   = float(latest.get("price") or latest.get("btcPrice") or 0)
+            total_mc   = float(latest.get("totalMarketCap") or latest.get("market_cap") or 0)
+            ts = latest.get("timestamp") or latest.get("time") or 0
+            if ts > 1e10:
+                date_str = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d %H:%M")
+            elif ts > 0:
+                date_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d %H:%M")
+            else:
+                date_str = "?"
             lines.append(f"BTC Dominance: {btc_dom_rt:.3f}%  |  BTC: ${btc_p_rt:,.2f}  |  Total MCap: {fmt(total_mc)}")
             lines.append(f"Updated: {date_str} UTC")
             lines.append("")
@@ -1784,12 +1836,16 @@ async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"Vol/MCap: {vm:.2f}%  |  vs ATH: {ath_p:.1f}%  (ATH ${ath:,.0f})")
         lines.append("")
 
-    # ETF holdings list — confirmed: ticker, aum_usd, asset_details.btc_holding
+    # ETF holdings list — v4: ticker/fundTicker, aum/aum_usd, fundType/fund_type, btcHolding
     if etf_list and etf_list.get("data"):
-        spot = sorted(
-            [x for x in etf_list["data"] if x.get("fund_type") == "Spot"],
-            key=lambda x: float(x.get("aum_usd",0) or 0), reverse=True
-        )
+        def _is_spot(x):
+            ft = x.get("fundType") or x.get("fund_type") or x.get("marketType") or ""
+            return "spot" in ft.lower() if ft else True  # default include if unknown
+        def _get_aum(x):
+            return float(x.get("aum") or x.get("aum_usd") or x.get("netAssets") or 0)
+        spot = sorted([x for x in etf_list["data"] if _is_spot(x)], key=_get_aum, reverse=True)
+        if not spot:
+            spot = sorted(etf_list["data"], key=_get_aum, reverse=True)
         if spot:
             lines.append("BTC SPOT ETF HOLDINGS:")
             lines.append(f"  {'TICKER':8} {'AUM':>12}  {'BTC HELD':>14}  {'24h BTC':>10}  {'7d BTC':>10}")
@@ -1798,12 +1854,16 @@ async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_aum = 0.0
             for item in spot[:10]:
                 try:
-                    ticker = item.get("ticker","?")
-                    aum    = float(item.get("aum_usd",0) or 0)
-                    ad     = item.get("asset_details",{}) or {}
-                    btc_h  = float(ad.get("btc_holding",0) or 0)
-                    chg24  = float(ad.get("btc_change_24h",0) or 0)
-                    chg7d  = float(ad.get("btc_change_7d",0) or 0)
+                    ticker = item.get("ticker") or item.get("fundTicker") or "?"
+                    aum    = _get_aum(item)
+                    # btcHolding may be at top level or inside asset_details
+                    ad     = item.get("asset_details") or item.get("assetDetails") or {}
+                    btc_h  = float(item.get("btcHolding") or item.get("btc_holding") or
+                                   ad.get("btcHolding") or ad.get("btc_holding") or 0)
+                    chg24  = float(item.get("btcChange24h") or item.get("btc_change_24h") or
+                                   ad.get("btcChange24h") or ad.get("btc_change_24h") or 0)
+                    chg7d  = float(item.get("btcChange7d") or item.get("btc_change_7d") or
+                                   ad.get("btcChange7d") or ad.get("btc_change_7d") or 0)
                     total_btc += btc_h
                     total_aum += aum
                     lines.append(f"  {ticker:8} {fmt(aum):>12}  {btc_h:>14,.1f}  {chg24:>+10.1f}  {chg7d:>+10.1f}")
@@ -1812,7 +1872,7 @@ async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  {'TOTAL':8} {fmt(total_aum):>12}  {total_btc:>14,.1f} BTC")
         lines.append("")
 
-    # ETF flow history — confirmed: timestamp, flow_usd, price_usd
+    # ETF flow history — v4: flowUsd/flow_usd, timestamp
     if etf_flows and etf_flows.get("data"):
         items = etf_flows["data"]
         try:
@@ -1824,8 +1884,13 @@ async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for item in items[:7]:
             try:
                 ts  = item.get("timestamp", 0)
-                date_str = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d") if ts > 1e10 else "?"
-                net = float(item.get("flow_usd", 0) or 0)
+                if ts > 1e10:
+                    date_str = datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d")
+                elif ts > 0:
+                    date_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d")
+                else:
+                    date_str = "?"
+                net = float(item.get("flowUsd") or item.get("flow_usd") or 0)
                 total_7d += net
                 sign = "+" if net >= 0 else ""
                 label_d = "INFLOW " if net >= 0 else "OUTFLOW"
@@ -1855,45 +1920,67 @@ async def cmd_macro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
-    events, prices = await asyncio.gather(
-        cg("/events", {"upcoming_events_only":"true","per_page":"15"}),
+    prices, gdata, fng = await asyncio.gather(
         cg_market("bitcoin,ethereum"),
+        cg_global(),
+        _fetch(FNG_URL, {}, {}),
     )
 
-    lines = [f"MACRO & EVENTS | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
+    now = datetime.now(timezone.utc)
+    lines = [f"MACRO BRIEFING | {now.strftime('%Y-%m-%d %H:%M')} UTC\n"]
+
     if prices:
         for c in prices:
+            ch24 = c.get("price_change_percentage_24h", 0) or 0
+            ch7d = c.get("price_change_percentage_7d_in_currency", 0) or 0
             lines.append(f"{c['symbol'].upper()}: {price_str(c['current_price'])}  "
-                         f"24h:{pct(c.get('price_change_percentage_24h',0))}")
+                         f"24h:{pct(ch24)}  7d:{pct(ch7d)}")
 
-    lines.append("\nHIGH-IMPACT RECURRING EVENTS:")
-    lines.append("  [RED]    FOMC — rate decision, most important macro event for crypto")
-    lines.append("  [RED]    US CPI — monthly inflation, risk-on/off binary trigger")
-    lines.append("  [RED]    US NFP — 1st Friday each month, macro risk sentiment")
-    lines.append("  [AMBER]  BTC options expiry — every Friday, large monthly on last Fri (Deribit)")
-    lines.append("  [AMBER]  Fed speakers — forward guidance shifts move markets")
-    lines.append("  [AMBER]  US PPI — leads CPI, precursor signal")
-    lines.append("  [INFO]   Token unlocks — tokenunlocks.app")
-    lines.append("  [INFO]   Governance votes — snapshot.org")
+    if gdata and "data" in gdata:
+        g = gdata["data"]
+        dom = g.get("market_cap_percentage", {})
+        lines.append(f"Total MC: {fmt(g['total_market_cap'].get('usd',0))}  "
+                     f"24h:{pct(g.get('market_cap_change_percentage_24h_usd',0))}")
+        lines.append(f"BTC Dom: {dom.get('btc',0):.2f}%  ETH Dom: {dom.get('eth',0):.2f}%")
 
-    if events and "data" in events:
-        lines.append("\nUPCOMING CRYPTO EVENTS:")
-        for e in events["data"][:10]:
-            date  = (e.get("start_date") or "?")[:10]
-            title = e.get("title", "?")[:45]
-            etype = e.get("type", "?")
-            coin  = (e.get("coin") or {}).get("name", "General")
-            lines.append(f"  {date}  {title:47}  [{etype}]  {coin}")
+    if fng and "data" in fng:
+        e = fng["data"][0]
+        lines.append(f"Fear & Greed: {e['value']}/100 — {e['value_classification']}")
 
-    lines.append("\nCalendar: ForexFactory.com  |  Investing.com  |  CMEGroup FedWatch")
+    lines.append("\nHIGH-IMPACT MACRO CALENDAR (recurring):")
+    lines.append("  [RED]    FOMC Meeting — rate decision + dot plot + press conference")
+    lines.append("           Schedule: 8x/year. Next dates: May 6-7, Jun 17-18, Jul 29-30, Sep 16-17, Nov 4-5, Dec 9-10 2025")
+    lines.append("           Crypto impact: hawkish surprise = risk-off selloff; dovish pivot = sustained rally")
+    lines.append("  [RED]    US CPI — monthly inflation print")
+    lines.append("           Schedule: ~2nd-3rd week each month (Tue/Wed). Released 8:30am ET")
+    lines.append("           Crypto impact: hot print = tightening fear; cold print = risk-on")
+    lines.append("  [RED]    US NFP — non-farm payrolls")
+    lines.append("           Schedule: 1st Friday each month, 8:30am ET")
+    lines.append("           Crypto impact: strong jobs = Fed stays hawkish; weak jobs = rate cut hope")
+    lines.append("  [AMBER]  US PPI — producer price index, precursor to CPI")
+    lines.append("           Schedule: 1 day before CPI each month")
+    lines.append("  [AMBER]  BTC Options Expiry (Deribit)")
+    lines.append("           Schedule: Every Friday. Large monthly on last Friday of month")
+    lines.append("           Pattern: price tends to move to max pain before expiry, then break free")
+    lines.append("  [AMBER]  Fed Speakers — speeches, congressional testimony")
+    lines.append("           Watch: Powell, Waller, Williams. Forward guidance shifts markets intraday")
+    lines.append("  [AMBER]  PCE Deflator — Fed's preferred inflation metric")
+    lines.append("           Schedule: last week of each month, 8:30am ET")
+    lines.append("  [INFO]   Token Unlocks — tokenunlocks.app (sell pressure calendar)")
+    lines.append("  [INFO]   Governance — snapshot.org (protocol votes, airdrop eligibility)")
+    lines.append("  [INFO]   CME BTC Futures Expiry — last Friday of each month, 4pm ET")
+    lines.append("\nReal-time calendars: ForexFactory.com | Investing.com | CMEGroup.com/trading/fedwatch")
 
     prompt = (
         "\n".join(lines) + "\n\n"
-        "TYPE A — MACRO BRIEFING.\n"
-        "Current macro regime: rates, dollar strength, equity correlation — net positive or negative?\n"
-        "List upcoming events with exact crypto impact direction and risk mechanism.\n"
-        "Pre-event playbook: 48h before FOMC/CPI — what does a trader do specifically?\n"
-        "One-line regime summary: risk-on / risk-off / transitional + single data point that defines it."
+        "TYPE A — MACRO REGIME BRIEFING.\n"
+        "Current macro regime: use BTC/ETH prices + Fear & Greed + Total MC data above.\n"
+        "State: risk-on / risk-off / transitional — with the single data point that defines current regime.\n"
+        "FOMC posture: what is the current market expectation for the next rate decision?\n"
+        "Pre-event playbook: what does an institutional desk do in the 48h before FOMC and CPI?\n"
+        "Crypto-macro correlation: is BTC trading as risk-asset or decoupling? State which.\n"
+        "Do NOT invent CPI/NFP/rate values. Describe mechanism and direction of impact only.\n"
+        "End with: REGIME LINE — one sentence, one data point."
     )
     result = await ask_groq(prompt, user.get("custom_instructions",""))
     await send(update, result)
@@ -1908,6 +1995,94 @@ async def cmd_gltest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
     report = await gl_debug(sym)
     await send(update, report)
+
+async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    args = context.args or []
+
+    if args and args[0].lower() == "add" and len(args) > 1:
+        query = " ".join(args[1:])
+        coin = await resolve_coin(query)
+        if not coin:
+            await update.message.reply_text(f"Could not resolve '{query}'. Try the full name or ticker (e.g. /watchlist add solana).")
+            return
+        cg_id = coin[0]
+        wl = user.get("watchlist", [])
+        if cg_id in wl:
+            await update.message.reply_text(f"{cg_id} is already on your watchlist.")
+            return
+        if len(wl) >= 15:
+            await update.message.reply_text("Watchlist limit is 15 coins. Remove one first: /watchlist remove [coin]")
+            return
+        wl.append(cg_id)
+        user["watchlist"] = wl
+        save_user(update.effective_user.id, user)
+        await update.message.reply_text(f"Added {cg_id} to watchlist. ({len(wl)}/15)")
+        return
+
+    if args and args[0].lower() == "remove" and len(args) > 1:
+        query = " ".join(args[1:])
+        coin = await resolve_coin(query)
+        cg_id = coin[0] if coin else query.lower()
+        wl = user.get("watchlist", [])
+        if cg_id not in wl:
+            # Try partial match
+            match = next((x for x in wl if query.lower() in x), None)
+            if match:
+                cg_id = match
+            else:
+                await update.message.reply_text(f"'{query}' not found on watchlist.")
+                return
+        wl.remove(cg_id)
+        user["watchlist"] = wl
+        save_user(update.effective_user.id, user)
+        await update.message.reply_text(f"Removed {cg_id}. Watchlist: {len(wl)} coins.")
+        return
+
+    # Show watchlist with live prices and analysis
+    wl = user.get("watchlist", ["bitcoin", "ethereum"])
+    if not wl:
+        await update.message.reply_text("Watchlist is empty.\nAdd coins: /watchlist add bitcoin")
+        return
+
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    ids = ",".join(wl)
+    data = await cg_market(ids)
+
+    if not data:
+        await update.message.reply_text("Could not fetch watchlist data. Try again.")
+        return
+
+    lines = [f"WATCHLIST | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
+    lines.append(f"{'COIN':8} {'PRICE':>12}  {'1H':>7}  {'24H':>7}  {'7D':>7}  {'VOL/MC':>7}  {'vs ATH':>7}")
+    lines.append("─"*68)
+    btc = next((c for c in data if c["id"] == "bitcoin"), None)
+    btc_24h = (btc.get("price_change_percentage_24h") or 0) if btc else 0
+    for c in data:
+        ch1h  = c.get("price_change_percentage_1h_in_currency") or 0
+        ch24h = c.get("price_change_percentage_24h") or 0
+        ch7d  = c.get("price_change_percentage_7d_in_currency") or 0
+        mc    = c.get("market_cap") or 1
+        vol   = c.get("total_volume") or 0
+        vm    = vol / mc * 100
+        ath_p = c.get("ath_change_percentage") or 0
+        lines.append(
+            f"{c['symbol'].upper():8} {price_str(c['current_price']):>12}  "
+            f"{pct(ch1h):>7}  {pct(ch24h):>7}  {pct(ch7d):>7}  {vm:>6.1f}%  {ath_p:>+6.1f}%"
+        )
+
+    prompt = (
+        "\n".join(lines) + "\n\n"
+        f"TYPE G — PORTFOLIO REVIEW for {len(wl)}-asset watchlist.\n"
+        "For each asset: state bias, the single most important level, and the allocation action.\n"
+        "BTC-relative performance: flag any asset outperforming or underperforming BTC by >5% on 7d.\n"
+        "Vol/MCap: flag any coin with >20% ratio (high conviction move) or <1% (dead money).\n"
+        "Portfolio summary: what is the aggregate risk posture? Which 2 assets have the strongest setup?\n"
+        "Use ONLY the live data above. No training-data prices."
+    )
+    result = await ask_groq(prompt, user.get("custom_instructions",""), max_tokens=1800)
+    await send(update, result)
+
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
@@ -2000,6 +2175,7 @@ async def main():
         ("funding",     cmd_funding),
         ("oi",          cmd_oi),
         ("ask",         cmd_ask),
+        ("watchlist",   cmd_watchlist),
         ("gltest",      cmd_gltest),
     ]
     for name, handler in handlers:
@@ -2024,6 +2200,7 @@ async def main():
             BotCommand("etf",         "Institutional proxy data"),
             BotCommand("macro",       "Macro event calendar"),
             BotCommand("ask",         "Ask anything with live data"),
+            BotCommand("watchlist",   "Portfolio watchlist — add/remove/analyze"),
             BotCommand("setup",       "Custom analyst profile"),
             BotCommand("help",        "All commands + examples"),
         ])

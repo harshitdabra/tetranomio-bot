@@ -1,0 +1,16 @@
+# Environment variables — never commit
+.env
+*.env
+
+# Runtime database
+cipher_db.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.vscode/
+.idea/
