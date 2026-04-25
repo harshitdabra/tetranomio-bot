@@ -35,10 +35,13 @@ GROQ_KEY        = os.getenv("GROQ_API_KEY", "")
 CG_KEY          = os.getenv("COINGECKO_API_KEY", "")
 GLASS_KEY       = os.getenv("COINGLASS_API_KEY", "")
 OWNER_ID        = int(os.getenv("ALLOWED_USER_ID", "1953473977"))
+OWNER_USERNAME  = os.getenv("OWNER_TELEGRAM", "")  # e.g. "harshitdabra" (no @)
 
 CG_BASE         = "https://pro-api.coingecko.com/api/v3"
 GLASS_BASE      = "https://open-api-v4.coinglass.com/api"
 LLAMA_BASE      = "https://api.llama.fi"
+STABLES_BASE    = "https://stablecoins.llama.fi"
+YIELDS_BASE     = "https://yields.llama.fi"
 FNG_URL         = "https://api.alternative.me/fng/?limit=3"
 
 DB_FILE         = Path("cipher_db.json")
@@ -78,6 +81,7 @@ def get_user(uid: int) -> dict:
             "joined": datetime.now(timezone.utc).isoformat(),
             "plan": "owner" if uid == OWNER_ID else "free",
             "query_count": 0,
+            "alerts": True,
         }
         save_db(db)
     return db["users"][key]
@@ -89,6 +93,24 @@ def save_user(uid: int, data: dict):
 
 def is_pro(uid: int) -> bool:
     return uid == OWNER_ID or get_user(uid).get("plan") in ("pro", "owner")
+
+async def tier_gate(update: Update) -> bool:
+    """Returns True if user can proceed (owner or pro). Sends paywall message if not."""
+    uid = update.effective_user.id
+    if uid == OWNER_ID or is_pro(uid):
+        return True
+    contact = f"@{OWNER_USERNAME}" if OWNER_USERNAME else "the bot owner"
+    await update.message.reply_text(
+        "CIPHER Pro required ($10/month).\n\n"
+        "Pro unlocks: /cipher  /btc  /derivatives  /defi  /dex\n"
+        "             /yields  /etf  /dominance  /trending\n"
+        "             /watchlist  /ask  + automatic alerts\n\n"
+        f"To upgrade, DM {contact} with your Telegram ID: "
+        f"`{uid}`\n\n"
+        "Free commands: /fear  /macro  /plans",
+        parse_mode="Markdown",
+    )
+    return False
 
 # ── Formatters ────────────────────────────────────────────────────────────────
 def fmt(n, dollar=True) -> str:
@@ -161,6 +183,35 @@ async def gl(endpoint: str, params: dict = None) -> dict | list | None:
 async def ll(endpoint: str) -> dict | list | None:
     """DeFiLlama — no auth needed."""
     return await _fetch(f"{LLAMA_BASE}{endpoint}", {}, {})
+
+async def ll_stables() -> list | None:
+    """Stablecoin market caps + 24h/7d supply change. No auth."""
+    result = await _fetch(f"{STABLES_BASE}/stablecoins", {}, {"includePrices": "true"})
+    if result and isinstance(result, dict) and result.get("peggedAssets"):
+        return result["peggedAssets"]
+    return None
+
+async def ll_dex() -> dict | None:
+    """DEX trading volumes — top protocols. No auth."""
+    return await _fetch(
+        f"{LLAMA_BASE}/overview/dexs", {},
+        {"excludeTotalDataChart": "true", "excludeTotalDataChartBreakdown": "true"},
+    )
+
+async def ll_fees() -> dict | None:
+    """Protocol fees + revenue. No auth."""
+    return await _fetch(
+        f"{LLAMA_BASE}/overview/fees", {},
+        {"excludeTotalDataChart": "true", "excludeTotalDataChartBreakdown": "true"},
+    )
+
+async def ll_yields(top: int = 25) -> list | None:
+    """Yield pools sorted by TVL. No auth."""
+    result = await _fetch(f"{YIELDS_BASE}/pools", {}, {})
+    if result and isinstance(result, dict) and result.get("data"):
+        pools = [p for p in result["data"] if p.get("tvlUsd", 0) > 1_000_000]
+        return sorted(pools, key=lambda p: p.get("tvlUsd", 0), reverse=True)[:top]
+    return None
 
 # ── Coin resolution ───────────────────────────────────────────────────────────
 # Maps ticker/name → CoinGecko ID and CoinGlass symbol
@@ -1213,53 +1264,186 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
+# ── Alert system ──────────────────────────────────────────────────────────────
+_alert_state: dict = {
+    "last_alert": {},   # {alert_key: unix_timestamp} — cooldown tracking
+    "fng_prev": None,   # previous F&G value for threshold-crossing detection
+}
+ALERT_COOLDOWN = 4 * 3600  # same alert can't fire more than once per 4 hours
+
+async def check_and_send_alerts(app) -> None:
+    now = time.time()
+    db = load_db()
+    opted_in = [int(uid) for uid, u in db["users"].items() if u.get("alerts", True)]
+    if not opted_in:
+        return
+
+    prices, funding, fng = await asyncio.gather(
+        cg_market("bitcoin,ethereum"),
+        gl_funding("BTC"),
+        _fetch(FNG_URL, {}, {}),
+    )
+
+    alerts = []
+
+    def _cooldown_ok(key: str) -> bool:
+        return now - _alert_state["last_alert"].get(key, 0) > ALERT_COOLDOWN
+
+    # Price shock — BTC or ETH moves >5% in 1h
+    if prices:
+        for c in prices:
+            sym = c["symbol"].upper()
+            ch1h = float(c.get("price_change_percentage_1h_in_currency") or 0)
+            if abs(ch1h) >= 5:
+                key = f"price_{sym}"
+                if _cooldown_ok(key):
+                    direction = "SURGE" if ch1h > 0 else "FLUSH"
+                    note = "monitor for continuation or reversal" if ch1h > 0 else "check derivatives for cascade risk"
+                    alerts.append((key, (
+                        f"[CIPHER ALERT]  PRICE {direction}\n"
+                        f"{sym}: {price_str(c['current_price'])}  {pct(ch1h)} 1h\n"
+                        f"Action: {note}"
+                    )))
+
+    # Extreme BTC funding rate — avg >0.10% or <-0.05%
+    if funding and funding.get("data"):
+        raw = funding["data"]
+        exs = (raw.get("stablecoin_margin_list") or raw.get("usdtMarginList")
+               or (raw if isinstance(raw, list) else []))
+        rates = []
+        for ex in exs:
+            r = ex.get("fundingRate") if ex.get("fundingRate") is not None else ex.get("funding_rate")
+            if r is not None:
+                rates.append(float(r))
+        if rates:
+            avg = sum(rates) / len(rates)
+            if avg > 0.001 or avg < -0.0005:
+                key = "funding_extreme"
+                if _cooldown_ok(key):
+                    bias = "OVERLEVERAGED LONG — long squeeze risk" if avg > 0 else "EXTREME SHORT BIAS — short squeeze building"
+                    alerts.append((key, (
+                        f"[CIPHER ALERT]  FUNDING EXTREME\n"
+                        f"BTC avg funding: {avg*100:.4f}%  {bias}\n"
+                        f"Action: {'reduce leveraged longs, tighten stops' if avg > 0 else 'watch for short squeeze trigger above key resistance'}"
+                    )))
+
+    # F&G threshold crossing — enters or exits extreme zones (<=20 or >=80)
+    if fng and "data" in fng:
+        val = int(fng["data"][0]["value"])
+        label = fng["data"][0]["value_classification"]
+        prev = _alert_state["fng_prev"]
+        if prev is not None:
+            crossed_fear   = prev > 20 and val <= 20
+            crossed_greed  = prev < 80 and val >= 80
+            left_fear      = prev <= 20 and val > 20
+            left_greed     = prev >= 80 and val < 80
+            if crossed_fear or crossed_greed or left_fear or left_greed:
+                key = "fng_cross"
+                if _cooldown_ok(key):
+                    if crossed_fear:
+                        note = "Extreme Fear: historically an institutional accumulation zone. Evaluate adding exposure."
+                    elif crossed_greed:
+                        note = "Extreme Greed: historically a risk reduction zone. Consider reducing notional 20-30%."
+                    elif left_fear:
+                        note = "Exiting Extreme Fear: sentiment shift underway. Watch for trend confirmation."
+                    else:
+                        note = "Exiting Extreme Greed: de-risking phase may begin. Review open positions."
+                    alerts.append((key, (
+                        f"[CIPHER ALERT]  SENTIMENT SHIFT\n"
+                        f"Fear & Greed: {val}/100 — {label}\n"
+                        f"{note}"
+                    )))
+        _alert_state["fng_prev"] = val
+
+    # Broadcast all alerts
+    for key, text in alerts:
+        _alert_state["last_alert"][key] = now
+        for uid in opted_in:
+            try:
+                await app.bot.send_message(chat_id=uid, text=text)
+            except Exception as e:
+                logger.warning(f"Alert send failed uid={uid}: {e}")
+
+async def run_alert_poller(app) -> None:
+    """Background task: checks market conditions every 15 minutes."""
+    await asyncio.sleep(90)  # startup delay so bot is fully initialised
+    while True:
+        try:
+            await check_and_send_alerts(app)
+        except Exception as e:
+            logger.error(f"Alert poller error: {e}")
+        await asyncio.sleep(900)  # 15 min
+
+# ── Commands ───────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     get_user(u.id)
     plan = "OWNER" if u.id == OWNER_ID else ("PRO" if is_pro(u.id) else "FREE")
+    if plan in ("PRO", "OWNER"):
+        body = (
+            "*Market:*  /cipher  /btc  /dominance  /trending\n"
+            "*DeFi:*    /defi  /dex  /yields\n"
+            "*Deriv:*   /derivatives  /funding  /oi\n"
+            "*Macro:*   /fear  /macro  /etf\n"
+            "*Tools:*   /ask  /watchlist  /alerts  /setup  /help\n\n"
+            "Or type any coin name, ticker, or question."
+        )
+    else:
+        contact = f"@{OWNER_USERNAME}" if OWNER_USERNAME else "the bot owner"
+        body = (
+            "*Free:*  /fear  /macro\n\n"
+            f"Upgrade to Pro ($10/month) for the full institutional suite:\n"
+            f"/cipher  /btc  /derivatives  /defi  /dex  /yields\n"
+            f"/etf  /dominance  /trending  /watchlist  /ask  + alerts\n\n"
+            f"DM {contact} to upgrade  |  /plans to see all features"
+        )
     await update.message.reply_text(
         f"*CIPHER Intelligence*  |  {plan}\n"
-        f"Welcome {u.first_name}\n\n"
-        "*Market:*  /cipher  /btc  /dominance  /trending\n"
-        "*DeFi:*    /defi\n"
-        "*Deriv:*   /derivatives  /funding  /oi\n"
-        "*Macro:*   /fear  /macro  /etf\n"
-        "*Tools:*   /ask  /setup  /help\n\n"
-        "Or just type any coin name, ticker, or question.",
+        f"Welcome, {u.first_name}.\n\n"
+        + body,
         parse_mode=ParseMode.MARKDOWN,
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    plan = "OWNER" if uid == OWNER_ID else ("PRO" if is_pro(uid) else "FREE")
+    free_note = "" if plan in ("PRO", "OWNER") else "\n_* = Pro only ($10/month) — /upgrade_"
+    p = "*" if plan not in ("PRO", "OWNER") else ""
     await update.message.reply_text(
-        "*CIPHER — Institutional Market Intelligence*\n\n"
+        f"*CIPHER — Institutional Market Intelligence*  |  {plan}\n"
+        + free_note + "\n\n"
         "*Market Reports*\n"
-        "`/cipher` — Full cycle: macro regime + market + derivatives + allocation signal\n"
-        "`/btc` — BTC institutional brief: all timeframes + full derivatives\n"
-        "`/dominance` — BTC/ETH dominance + capital rotation analysis\n"
-        "`/trending` — Trending + gainers/losers + volume conviction\n\n"
-        "*DeFi*\n"
-        "`/defi` — DeFi TVL by protocol + chain (live)\n\n"
+        f"`/cipher`{p} — Full cycle: macro + market + derivatives + allocation signal\n"
+        f"`/btc`{p} — BTC institutional brief: all timeframes + full derivatives\n"
+        f"`/dominance`{p} — BTC/ETH dominance + capital rotation analysis\n"
+        f"`/trending`{p} — Trending + gainers/losers + volume conviction\n\n"
+        "*DeFi & On-chain*\n"
+        f"`/defi`{p} — TVL by protocol + chain + DEX volume overview\n"
+        f"`/dex`{p} — DEX volume rankings (Uniswap, Curve, GMX...)\n"
+        f"`/yields`{p} — Top yield pools by TVL (DeFiLlama)\n\n"
         "*Derivatives*\n"
-        "`/derivatives [coin]` — Funding + OI + long/short + liquidations\n"
-        "`/funding [coin]` — Funding rates across all exchanges\n"
-        "`/oi [coin]` — Open interest breakdown by exchange\n\n"
+        f"`/derivatives [coin]`{p} — Funding + OI + long/short + liquidations\n"
+        f"`/funding [coin]`{p} — Funding rates across all exchanges\n"
+        f"`/oi [coin]`{p} — Open interest breakdown by exchange\n\n"
         "*Macro & Sentiment*\n"
         "`/fear` — Fear & Greed + stablecoin supply analysis\n"
-        "`/etf` — Institutional ETF flow + holdings data\n"
-        "`/macro` — Macro regime + event calendar\n\n"
-        "*Portfolio*\n"
-        "`/watchlist` — Analyze your watchlist\n"
-        "`/watchlist add chainlink` — Add coin to watchlist\n"
-        "`/watchlist remove chainlink` — Remove coin\n"
-        "`/ask [question]` — Any question with live data\n"
-        "`/setup` — Custom analyst profile\n\n"
-        "*Free-text works for everything:*\n"
-        "`what about TAO`  `should I add to SOL`  `is LINK breaking out`\n"
-        "`compare SOL vs AVAX`  `explain funding rates`  `any risk alerts`",
+        f"`/etf`{p} — Institutional ETF flow + BTC holdings\n"
+        "`/macro` — Macro regime + FOMC/CPI/NFP event calendar\n\n"
+        "*Portfolio & Tools*\n"
+        f"`/watchlist`{p} — Analyze your watchlist\n"
+        f"`/watchlist add solana`{p} — Add coin  |  `/watchlist remove solana` — Remove\n"
+        f"`/ask [question]`{p} — Any question with live data\n"
+        f"`/alerts` — Automatic market alerts (on/off)\n"
+        "`/setup` — Custom analyst profile\n"
+        "`/plans` — See all features + pricing\n"
+        "`/upgrade` — Upgrade to Pro\n\n"
+        "*Free-text (Pro):*\n"
+        "`what about TAO`  `should I add to SOL`  `compare SOL vs AVAX`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 async def cmd_cipher(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await tier_gate(update): return
     user = get_user(update.effective_user.id)
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
@@ -1354,6 +1538,7 @@ async def cmd_cipher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send(update, result)
 
 async def cmd_btc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await tier_gate(update): return
     user = get_user(update.effective_user.id)
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
@@ -1418,6 +1603,7 @@ async def cmd_btc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send(update, result)
 
 async def cmd_derivatives(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await tier_gate(update): return
     user = get_user(update.effective_user.id)
     raw_sym = " ".join(context.args).strip().upper() if context.args else "BTC"
     gl_sym = raw_sym
@@ -1472,6 +1658,7 @@ async def cmd_derivatives(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send(update, result)
 
 async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await tier_gate(update): return
     user = get_user(update.effective_user.id)
     raw_sym = " ".join(context.args).strip().upper() if context.args else "BTC"
     coin = await resolve_coin(raw_sym.lower())
@@ -1525,6 +1712,7 @@ async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send(update, result)
 
 async def cmd_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await tier_gate(update): return
     user = get_user(update.effective_user.id)
     raw_sym = " ".join(context.args).strip().upper() if context.args else "BTC"
     coin = await resolve_coin(raw_sym.lower())
@@ -1566,6 +1754,7 @@ async def cmd_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send(update, result)
 
 async def cmd_dominance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await tier_gate(update): return
     user = get_user(update.effective_user.id)
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
@@ -1631,6 +1820,7 @@ async def cmd_dominance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send(update, result)
 
 async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await tier_gate(update): return
     user = get_user(update.effective_user.id)
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
@@ -1695,36 +1885,56 @@ async def cmd_trending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send(update, result)
 
 async def cmd_defi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await tier_gate(update): return
     user = get_user(update.effective_user.id)
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
-    tvl, protocols, chains = await asyncio.gather(
-        ll("/tvl"), ll("/protocols"), ll("/v2/chains")
+    tvl, protocols, chains, dex_data = await asyncio.gather(
+        ll("/tvl"), ll("/protocols"), ll("/v2/chains"), ll_dex()
     )
 
-    lines = [f"DEFI TVL | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
+    lines = [f"DEFI DASHBOARD | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
+
     if tvl:
         try:
             lines.append(f"Total DeFi TVL: {fmt(float(tvl))}")
         except Exception:
             pass
 
-    if protocols:
-        valid = sorted([p for p in protocols if float(p.get("tvl") or 0)>0],
-                       key=lambda x: float(x.get("tvl") or 0), reverse=True)[:15]
-        lines.append(f"\n{'PROTOCOL':22} {'TVL':>10}  {'1D':>7}  {'7D':>7}  CHAIN")
-        lines.append("─"*62)
-        for p in valid:
-            ch1d = p.get("change_1d") or 0
-            ch7d = p.get("change_7d") or 0
+    # DEX volumes
+    if dex_data and dex_data.get("protocols"):
+        dex_protos = sorted(
+            [p for p in dex_data["protocols"] if p.get("total24h")],
+            key=lambda x: x.get("total24h", 0), reverse=True
+        )[:10]
+        total_dex_24h = dex_data.get("total24h") or sum(p.get("total24h", 0) for p in dex_protos)
+        lines.append(f"\nDEX VOLUMES (24h)")
+        lines.append(f"Total DEX 24h: {fmt(total_dex_24h)}")
+        lines.append(f"{'DEX':20} {'24H VOL':>10}  {'7D VOL':>10}  {'1D%':>7}")
+        lines.append("─"*54)
+        for p in dex_protos:
             lines.append(
-                f"{p['name']:22} {fmt(p.get('tvl') or 0):>10}  "
-                f"{pct(ch1d):>7}  {pct(ch7d):>7}  {p.get('chain','multi')}"
+                f"{p['name']:20} {fmt(p.get('total24h') or 0):>10}  "
+                f"{fmt(p.get('total7d') or 0):>10}  {pct(p.get('change_1d') or 0):>7}"
             )
 
+    # Top protocols by TVL
+    if protocols:
+        valid = sorted([p for p in protocols if float(p.get("tvl") or 0) > 0],
+                       key=lambda x: float(x.get("tvl") or 0), reverse=True)[:12]
+        lines.append(f"\n{'PROTOCOL TVL':22} {'TVL':>10}  {'1D':>7}  {'7D':>7}  CHAIN")
+        lines.append("─"*62)
+        for p in valid:
+            lines.append(
+                f"{p['name']:22} {fmt(p.get('tvl') or 0):>10}  "
+                f"{pct(p.get('change_1d') or 0):>7}  {pct(p.get('change_7d') or 0):>7}  "
+                f"{p.get('chain','multi')}"
+            )
+
+    # Top chains by TVL
     if chains:
-        valid_c = sorted([c for c in chains if float(c.get("tvl") or 0)>0],
-                         key=lambda x: float(x.get("tvl") or 0), reverse=True)[:10]
+        valid_c = sorted([c for c in chains if float(c.get("tvl") or 0) > 0],
+                         key=lambda x: float(x.get("tvl") or 0), reverse=True)[:8]
         lines.append(f"\n{'CHAIN':18} {'TVL':>10}")
         lines.append("─"*30)
         for c in valid_c:
@@ -1732,14 +1942,15 @@ async def cmd_defi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prompt = (
         "\n".join(lines) + "\n\n"
-        "DEFI REPORT — use only the TVL data above.\n"
+        "DEFI REPORT — use only the data above.\n"
         "Do NOT write MARKET STRUCTURE, ON-CHAIN CONTEXT, or DERIVATIVES sections.\n"
         "Do NOT include a TRADE SETUP section.\n"
-        "Total TVL direction and implication.\n"
-        "Top 3 gaining protocols: which and why.\n"
-        "Top 3 losing protocols: price effect or genuine exit?\n"
-        "Chain share shifts: flag any chain gaining significant share.\n"
-        "ACTION line: one sentence on where capital is moving."
+        "1. Total TVL: direction and what it signals about risk appetite.\n"
+        "2. DEX volumes: which protocols are capturing trading flow and why.\n"
+        "3. Top 3 TVL gainers: genuine capital inflow or price effect?\n"
+        "4. Top 3 TVL losers: exit or rotation?\n"
+        "5. Chain dominance: flag any chain gaining or losing significant share.\n"
+        "ACTION line: one sentence on where on-chain capital is moving."
     )
     result = await ask_groq(prompt, user.get("custom_instructions",""))
     await send(update, result)
@@ -1810,6 +2021,7 @@ async def cmd_fear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send(update, result)
 
 async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await tier_gate(update): return
     user = get_user(update.effective_user.id)
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
@@ -1997,6 +2209,7 @@ async def cmd_gltest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send(update, report)
 
 async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await tier_gate(update): return
     user = get_user(update.effective_user.id)
     args = context.args or []
 
@@ -2085,6 +2298,7 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await tier_gate(update): return
     user = get_user(update.effective_user.id)
     question = " ".join(context.args).strip() if context.args else ""
     if not question:
@@ -2134,11 +2348,197 @@ async def cmd_setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
+async def cmd_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    plan = "OWNER" if uid == OWNER_ID else ("PRO" if is_pro(uid) else "FREE")
+    contact = f"@{OWNER_USERNAME}" if OWNER_USERNAME else "the bot owner"
+    await update.message.reply_text(
+        f"*CIPHER Plans*  |  Your current plan: {plan}\n\n"
+        "*FREE — No cost*\n"
+        "  /fear — Fear & Greed + stablecoin supply\n"
+        "  /macro — Macro regime + FOMC/CPI/NFP calendar\n"
+        "  Automatic market alerts (price shocks, funding extremes)\n\n"
+        "*PRO — $10 / month*\n"
+        "  Everything in Free, plus:\n"
+        "  /cipher — Full institutional market report\n"
+        "  /btc — BTC deep-dive with full derivatives\n"
+        "  /defi — TVL + DEX volumes + chain share\n"
+        "  /dex — DEX volume rankings (Uniswap, Curve, GMX...)\n"
+        "  /yields — Top yield pools by TVL (DeFiLlama)\n"
+        "  /derivatives — Funding + OI + long/short + liquidations\n"
+        "  /funding — Per-exchange funding rates\n"
+        "  /oi — Open interest breakdown\n"
+        "  /etf — Institutional ETF flows + BTC holdings\n"
+        "  /dominance — BTC dominance + alt rotation signal\n"
+        "  /trending — Trending + gainers/losers\n"
+        "  /watchlist — Portfolio monitoring (up to 15 coins)\n"
+        "  /ask — Free-text question with live data\n"
+        "  Free-text analysis on any coin or question\n\n"
+        f"To upgrade: /upgrade\n"
+        f"Contact: {contact}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid == OWNER_ID or is_pro(uid):
+        await update.message.reply_text("You already have CIPHER Pro. Thank you.")
+        return
+    contact = f"@{OWNER_USERNAME}" if OWNER_USERNAME else "the bot owner"
+    await update.message.reply_text(
+        "*Upgrade to CIPHER Pro — $10/month*\n\n"
+        "Payment: Crypto (USDT / USDC — any chain)\n\n"
+        f"DM {contact} with:\n"
+        f"  1. Your Telegram user ID: `{uid}`\n"
+        "  2. Proof of payment (tx hash or screenshot)\n\n"
+        "Access activated within 24 hours.\n\n"
+        "/plans — see all features",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = get_user(uid)
+    args = context.args or []
+
+    if args and args[0].lower() == "off":
+        user["alerts"] = False
+        save_user(uid, user)
+        await update.message.reply_text("Alerts disabled. Use /alerts on to re-enable.")
+        return
+
+    if args and args[0].lower() == "on":
+        user["alerts"] = True
+        save_user(uid, user)
+        await update.message.reply_text("Alerts enabled. You will receive automatic market alerts.")
+        return
+
+    status = "ON" if user.get("alerts", True) else "OFF"
+    await update.message.reply_text(
+        f"*CIPHER Automatic Alerts*  |  Status: {status}\n\n"
+        "Active triggers:\n"
+        "  BTC or ETH price moves >5% in 1 hour\n"
+        "  BTC funding rate crosses extreme (>0.10% or <-0.05%)\n"
+        "  Fear & Greed enters or exits extreme zones (<=20 or >=80)\n\n"
+        "Alerts are automatic and sent to all users by default.\n"
+        "  /alerts off — disable\n"
+        "  /alerts on  — re-enable",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+async def cmd_dex(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await tier_gate(update): return
+    user = get_user(update.effective_user.id)
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+
+    dex_data, fees_data = await asyncio.gather(ll_dex(), ll_fees())
+
+    lines = [f"DEX VOLUMES | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
+
+    if dex_data and dex_data.get("protocols"):
+        protos = sorted(
+            [p for p in dex_data["protocols"] if p.get("total24h")],
+            key=lambda x: x.get("total24h", 0), reverse=True
+        )[:15]
+        total_24h = dex_data.get("total24h") or sum(p.get("total24h", 0) for p in protos)
+        total_7d  = dex_data.get("total7d")  or sum(p.get("total7d", 0) for p in protos)
+        lines.append(f"Total DEX 24h: {fmt(total_24h)}  |  7d: {fmt(total_7d)}")
+        lines.append(f"\n{'DEX':22} {'24H VOL':>10}  {'7D VOL':>10}  {'1D%':>7}  CHAINS")
+        lines.append("─"*66)
+        for p in protos:
+            chains_str = ", ".join(p.get("chains", [])[:3]) or p.get("chain", "?")
+            lines.append(
+                f"{p['name']:22} {fmt(p.get('total24h') or 0):>10}  "
+                f"{fmt(p.get('total7d') or 0):>10}  {pct(p.get('change_1d') or 0):>7}  {chains_str}"
+            )
+    else:
+        lines.append("DEX volume data unavailable")
+
+    if fees_data and fees_data.get("protocols"):
+        fee_protos = sorted(
+            [p for p in fees_data["protocols"] if p.get("total24h")],
+            key=lambda x: x.get("total24h", 0), reverse=True
+        )[:8]
+        lines.append(f"\n{'PROTOCOL FEES (24h)':22} {'FEES':>10}  {'REVENUE':>10}")
+        lines.append("─"*46)
+        for p in fee_protos:
+            rev = p.get("totalRevenue24h") or p.get("revenue24h") or 0
+            lines.append(
+                f"{p['name']:22} {fmt(p.get('total24h') or 0):>10}  {fmt(rev):>10}"
+            )
+
+    prompt = (
+        "\n".join(lines) + "\n\n"
+        "DEX VOLUME REPORT — use only the data above.\n"
+        "Do NOT write ON-CHAIN CONTEXT, DERIVATIVES, or TRADE SETUP sections.\n"
+        "1. Who is capturing DEX market share and why (Uniswap vs Curve vs GMX etc).\n"
+        "2. Fee/revenue leaders: which protocols are most profitable per unit volume?\n"
+        "3. Volume trend: is 24h accelerating or decelerating vs 7d run-rate?\n"
+        "4. Capital implication: what does DEX volume composition tell us about risk appetite?\n"
+        "One-line verdict: where is trading activity concentrating and what does that signal."
+    )
+    result = await ask_groq(prompt, user.get("custom_instructions",""))
+    await send(update, result)
+
+async def cmd_yields(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await tier_gate(update): return
+    user = get_user(update.effective_user.id)
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+
+    pools = await ll_yields(top=30)
+
+    lines = [f"YIELD POOLS | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
+    lines.append("Source: DeFiLlama — pools >$1M TVL, sorted by TVL\n")
+
+    if pools:
+        lines.append(f"{'PROJECT':20} {'SYMBOL':10} {'TVL':>10}  {'APY':>7}  {'BASE':>7}  {'REWARD':>7}  CHAIN")
+        lines.append("─"*82)
+        for p in pools[:25]:
+            sym    = (p.get("symbol") or "")[:10]
+            proj   = (p.get("project") or "")[:20]
+            tvl    = p.get("tvlUsd") or 0
+            apy    = p.get("apy") or 0
+            base   = p.get("apyBase") or 0
+            reward = p.get("apyReward") or 0
+            chain  = p.get("chain") or "?"
+            il_risk = " IL" if p.get("ilRisk") not in (None, "no", "none") else ""
+            lines.append(
+                f"{proj:20} {sym:10} {fmt(tvl):>10}  {apy:>6.2f}%  {base:>6.2f}%  {reward:>6.2f}%  {chain}{il_risk}"
+            )
+        # Stablecoin-only pools (no IL risk) — highest APY
+        stable_pools = sorted(
+            [p for p in pools if p.get("exposure") in ("single", "stable") or p.get("ilRisk") in (None, "no", "none")],
+            key=lambda x: x.get("apy") or 0, reverse=True
+        )[:5]
+        if stable_pools:
+            lines.append("\nTOP STABLE / NO-IL POOLS BY APY:")
+            for p in stable_pools:
+                lines.append(
+                    f"  {(p.get('project') or '')[:20]:20} {(p.get('symbol') or '')[:10]:10} "
+                    f"TVL:{fmt(p.get('tvlUsd') or 0):>10}  APY:{p.get('apy') or 0:.2f}%  {p.get('chain','?')}"
+                )
+    else:
+        lines.append("Yield pool data unavailable")
+
+    prompt = (
+        "\n".join(lines) + "\n\n"
+        "YIELD FARMING REPORT — use only the pool data above.\n"
+        "Do NOT write DERIVATIVES, MARKET STRUCTURE, or TRADE SETUP sections.\n"
+        "1. Highest-conviction yield pools: TVL depth + APY sustainability (base vs reward split).\n"
+        "2. Stablecoin yield: best risk-adjusted options for capital preservation with yield.\n"
+        "3. IL risk: flag any high-APY pools where impermanent loss risk is elevated.\n"
+        "4. Reward vs base: heavy reward APY with low base = emissions-dependent, unsustainable.\n"
+        "Verdict: two or three specific pools worth evaluating for institutional allocators. State chain, TVL, APY."
+    )
+    result = await ask_groq(prompt, user.get("custom_instructions",""), max_tokens=1800)
+    await send(update, result)
+
 # ── Free-text ─────────────────────────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
         return
+    if not await tier_gate(update): return
     user = get_user(update.effective_user.id)
     await handle_query(update, context, text, user)
 
@@ -2163,11 +2563,16 @@ async def main():
     handlers = [
         ("start",       cmd_start),
         ("help",        cmd_help),
+        ("plans",       cmd_plans),
+        ("upgrade",     cmd_upgrade),
+        ("alerts",      cmd_alerts),
         ("cipher",      cmd_cipher),
         ("btc",         cmd_btc),
         ("dominance",   cmd_dominance),
         ("trending",    cmd_trending),
         ("defi",        cmd_defi),
+        ("dex",         cmd_dex),
+        ("yields",      cmd_yields),
         ("fear",        cmd_fear),
         ("etf",         cmd_etf),
         ("macro",       cmd_macro),
@@ -2188,23 +2593,29 @@ async def main():
     async with app:
         await app.initialize()
         await app.bot.set_my_commands([
-            BotCommand("cipher",      "Full cycle: market + derivatives + macro"),
-            BotCommand("btc",         "BTC deep dive with full derivatives"),
-            BotCommand("derivatives", "Funding + OI + long/short + liquidations"),
-            BotCommand("funding",     "Funding rates across all exchanges"),
-            BotCommand("oi",          "Open interest breakdown by exchange"),
-            BotCommand("dominance",   "BTC dominance + altcoin rotation"),
-            BotCommand("trending",    "Trending + gainers/losers + vol quality"),
-            BotCommand("defi",        "DeFi TVL by protocol + chain"),
+            BotCommand("cipher",      "Full institutional report (Pro)"),
+            BotCommand("btc",         "BTC deep dive with full derivatives (Pro)"),
+            BotCommand("defi",        "DeFi TVL + DEX volumes (Pro)"),
+            BotCommand("dex",         "DEX volume rankings (Pro)"),
+            BotCommand("yields",      "Top yield pools by TVL (Pro)"),
+            BotCommand("derivatives", "Funding + OI + liquidations (Pro)"),
+            BotCommand("funding",     "Funding rates across exchanges (Pro)"),
+            BotCommand("oi",          "Open interest breakdown (Pro)"),
+            BotCommand("dominance",   "BTC dominance + alt rotation (Pro)"),
+            BotCommand("trending",    "Trending + gainers/losers (Pro)"),
+            BotCommand("etf",         "Institutional ETF flows (Pro)"),
             BotCommand("fear",        "Fear & Greed + stablecoin supply"),
-            BotCommand("etf",         "Institutional proxy data"),
-            BotCommand("macro",       "Macro event calendar"),
-            BotCommand("ask",         "Ask anything with live data"),
-            BotCommand("watchlist",   "Portfolio watchlist — add/remove/analyze"),
+            BotCommand("macro",       "Macro regime + event calendar"),
+            BotCommand("alerts",      "Automatic market alerts on/off"),
+            BotCommand("watchlist",   "Portfolio watchlist (Pro)"),
+            BotCommand("ask",         "Ask anything with live data (Pro)"),
+            BotCommand("plans",       "See all features + pricing"),
+            BotCommand("upgrade",     "Upgrade to Pro ($10/month)"),
             BotCommand("setup",       "Custom analyst profile"),
             BotCommand("help",        "All commands + examples"),
         ])
-        logger.info("CIPHER — Definitive Release — Online")
+        logger.info("CIPHER — Online")
+        asyncio.create_task(run_alert_poller(app))
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         await asyncio.Event().wait()
