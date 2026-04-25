@@ -12,6 +12,7 @@ Architecture:
 """
 
 import os, json, logging, asyncio, httpx, re, time
+from aiohttp import web
 from pathlib import Path
 from datetime import datetime, timezone
 from groq import Groq
@@ -2550,6 +2551,21 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(update, Update) and update.message:
         await update.message.reply_text("Something went wrong. Try again.")
 
+# ── Health server (required by Render free tier) ──────────────────────────────
+async def start_health_server():
+    port = int(os.getenv("PORT", "8080"))
+
+    async def health(_):
+        return web.Response(text="CIPHER OK")
+
+    srv = web.Application()
+    srv.router.add_get("/", health)
+    srv.router.add_get("/health", health)
+    runner = web.AppRunner(srv)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    logger.info(f"Health server listening on port {port}")
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -2615,6 +2631,7 @@ async def main():
             BotCommand("help",        "All commands + examples"),
         ])
         logger.info("CIPHER — Online")
+        asyncio.create_task(start_health_server())
         asyncio.create_task(run_alert_poller(app))
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
