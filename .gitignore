@@ -4,6 +4,7 @@
 
 # Runtime database
 cipher_db.json
+tetranomio_db.json
 
 # Python
 __pycache__/

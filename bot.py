@@ -1,5 +1,5 @@
 """
-Blockiva Telegram Bot
+Tetranomio Telegram Bot  (@tetranomio_bot)
 Data: CoinGecko Pro + CoinGlass Pro + DeFiLlama + Alternative.me
 AI:   Groq Llama 3.3 70B
 
@@ -28,7 +28,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger("CIPHER")
+logger = logging.getLogger("TETRANOMIO")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -45,7 +45,7 @@ STABLES_BASE    = "https://stablecoins.llama.fi"
 YIELDS_BASE     = "https://yields.llama.fi"
 FNG_URL         = "https://api.alternative.me/fng/?limit=3"
 
-DB_FILE         = Path("cipher_db.json")
+DB_FILE         = Path("tetranomio_db.json")
 WAITING_SETUP   = 1
 
 # ── In-memory DB ──────────────────────────────────────────────────────────────
@@ -102,7 +102,7 @@ async def tier_gate(update: Update) -> bool:
         return True
     contact = f"@{OWNER_USERNAME}" if OWNER_USERNAME else "the bot owner"
     await update.message.reply_text(
-        "Blockiva Pro required ($10/month).\n\n"
+        "Tetranomio Pro required ($10/month).\n\n"
         "Pro unlocks: /cipher  /btc  /derivatives  /defi  /dex\n"
         "             /yields  /etf  /dominance  /trending\n"
         "             /watchlist  /ask  + automatic alerts\n\n"
@@ -868,7 +868,7 @@ def derivatives_anchor(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
 
     parts.append("ANY number not listed above = HALLUCINATION. Do not use it.")
     return "\n".join(parts)
-CIPHER_SYSTEM = """IDENTITY
+TETRANOMIO_SYSTEM = """IDENTITY
 You are BLOCKIVA — senior digital assets analyst at a tier-1 institutional desk (BlackRock / Goldman Sachs / Fidelity caliber).
 You write at the standard of a morning markets brief distributed to portfolio managers and CIOs before open.
 Every output must be immediately actionable: a PM reading your response should know exactly what to do with their book.
@@ -983,7 +983,7 @@ STYLE: Tier-1 institutional morning brief. Bloomberg terminal density. Active vo
 # ── Groq call ─────────────────────────────────────────────────────────────────
 async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 1500) -> str:
     client = Groq(api_key=GROQ_KEY)
-    system = CIPHER_SYSTEM + (f"\n\nANALYST CONTEXT:\n{custom}" if custom.strip() else "")
+    system = TETRANOMIO_SYSTEM + (f"\n\nANALYST CONTEXT:\n{custom}" if custom.strip() else "")
     loop = asyncio.get_event_loop()
 
     def _sync_call():
@@ -999,17 +999,17 @@ async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 1500) -> str
 
     try:
         resp = await asyncio.wait_for(loop.run_in_executor(None, _sync_call), timeout=50)
-        return resp.choices[0].message.content.strip() or "Blockiva: empty response."
+        return resp.choices[0].message.content.strip() or "Tetranomio: empty response."
     except asyncio.TimeoutError:
-        return "Blockiva: Groq timeout (50s). Try again."
+        return "Tetranomio: Groq timeout (50s). Try again."
     except Exception as e:
         logger.error(f"Groq error: {e}")
-        return f"Blockiva: AI error — {str(e)[:120]}"
+        return f"Tetranomio: AI error — {str(e)[:120]}"
 
 # ── Send helper ───────────────────────────────────────────────────────────────
 async def send(update: Update, text: str):
     if not text.strip():
-        await update.message.reply_text("Blockiva: no output. Try again.")
+        await update.message.reply_text("Tetranomio: no output. Try again.")
         return
     for i in range(0, len(text), 4000):
         await update.message.reply_text(text[i:i+4000])
@@ -1399,7 +1399,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"DM {contact} to upgrade  |  /plans to see all features"
         )
     await update.message.reply_text(
-        f"*Blockiva Intelligence*  |  {plan}\n"
+        f"*Tetranomio Intelligence*  |  {plan}\n"
         f"Welcome, {u.first_name}.\n\n"
         + body,
         parse_mode=ParseMode.MARKDOWN,
@@ -1411,7 +1411,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     free_note = "" if plan in ("PRO", "OWNER") else "\n_* = Pro only ($10/month) — /upgrade_"
     p = "*" if plan not in ("PRO", "OWNER") else ""
     await update.message.reply_text(
-        f"*Blockiva — Institutional Market Intelligence*  |  {plan}\n"
+        f"*Tetranomio — Institutional Market Intelligence*  |  {plan}\n"
         + free_note + "\n\n"
         "*Market Reports*\n"
         f"`/cipher`{p} — Full cycle: macro + market + derivatives + allocation signal\n"
@@ -1528,7 +1528,7 @@ async def cmd_cipher(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "\n".join(defi_lines),
             deriv_section,
         ]) +
-        "\n\nTYPE A — Full Blockiva cycle report.\n"
+        "\n\nTYPE A — Full Tetranomio cycle report.\n"
         "For every metric: state the number AND its implication in the same sentence.\n"
         "Derivatives are primary signals — lead with funding rate and OI interpretation.\n"
         "Stablecoin total supply direction and Vol/MCap — interpret explicitly.\n"
@@ -2321,9 +2321,9 @@ async def cmd_setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
     current = user.get("custom_instructions","").strip()
     await update.message.reply_text(
-        "*Blockiva — Custom Analyst Profile*\n\n"
+        "*Tetranomio — Custom Analyst Profile*\n\n"
         f"Current: `{current or 'none set'}`\n\n"
-        "This context is injected into every Blockiva response. Be specific.\n\n"
+        "This context is injected into every Tetranomio response. Be specific.\n\n"
         "Good examples:\n"
         "  Focus coins: BTC, ETH, SOL, LINK, TAO, SEI\n"
         "  Style: swing trading, 3-7 day holds\n"
@@ -2354,7 +2354,7 @@ async def cmd_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plan = "OWNER" if uid == OWNER_ID else ("PRO" if is_pro(uid) else "FREE")
     contact = f"@{OWNER_USERNAME}" if OWNER_USERNAME else "the bot owner"
     await update.message.reply_text(
-        f"*Blockiva Plans*  |  Your current plan: {plan}\n\n"
+        f"*Tetranomio Plans*  |  Your current plan: {plan}\n\n"
         "*FREE — No cost*\n"
         "  /fear — Fear & Greed + stablecoin supply\n"
         "  /macro — Macro regime + FOMC/CPI/NFP calendar\n"
@@ -2383,11 +2383,11 @@ async def cmd_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid == OWNER_ID or is_pro(uid):
-        await update.message.reply_text("You already have Blockiva Pro. Thank you.")
+        await update.message.reply_text("You already have Tetranomio Pro. Thank you.")
         return
     contact = f"@{OWNER_USERNAME}" if OWNER_USERNAME else "the bot owner"
     await update.message.reply_text(
-        "*Upgrade to Blockiva Pro — $10/month*\n\n"
+        "*Upgrade to Tetranomio Pro — $10/month*\n\n"
         "Payment: Crypto (USDT / USDC — any chain)\n\n"
         f"DM {contact} with:\n"
         f"  1. Your Telegram user ID: `{uid}`\n"
@@ -2416,7 +2416,7 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status = "ON" if user.get("alerts", True) else "OFF"
     await update.message.reply_text(
-        f"*Blockiva Automatic Alerts*  |  Status: {status}\n\n"
+        f"*Tetranomio Automatic Alerts*  |  Status: {status}\n\n"
         "Active triggers:\n"
         "  BTC or ETH price moves >5% in 1 hour\n"
         "  BTC funding rate crosses extreme (>0.10% or <-0.05%)\n"
@@ -2556,7 +2556,7 @@ async def start_health_server():
     port = int(os.getenv("PORT", "8080"))
 
     async def health(_):
-        return web.Response(text="Blockiva OK")
+        return web.Response(text="Tetranomio OK")
 
     srv = web.Application()
     srv.router.add_get("/", health)
@@ -2630,7 +2630,7 @@ async def main():
             BotCommand("setup",       "Custom analyst profile"),
             BotCommand("help",        "All commands + examples"),
         ])
-        logger.info("Blockiva — Online")
+        logger.info("Tetranomio — Online")
         asyncio.create_task(start_health_server())
         asyncio.create_task(run_alert_poller(app))
         await app.start()
