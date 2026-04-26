@@ -713,22 +713,16 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
     else:
         lines.append("\nFunding Rates: unavailable")
 
-    # Open Interest — v4: list of exchange objects; aggregate row has exchangeName=="All"
+    # Open Interest — v4: list of per-exchange objects, sum for total
     if oi_data and oi_data.get("data"):
         items = oi_data["data"]
         items = items if isinstance(items, list) else [items]
-        def _ex_name(x): return x.get("exchangeName") or x.get("exchange") or ""
-        agg = next((x for x in items if _ex_name(x) == "All"), items[0] if items else {})
-        total_oi = float(agg.get("openInterestUsd") or agg.get("open_interest_usd") or 0)
-        ch1h  = float(agg.get("h1OIChangePercent") or agg.get("open_interest_change_percent_1h") or 0)
-        ch4h  = float(agg.get("h4OIChangePercent") or agg.get("open_interest_change_percent_4h") or 0)
-        ch24h = float(agg.get("h24Change") or agg.get("oichangePercent") or agg.get("open_interest_change_percent_24h") or 0)
+        def _ex_name(x): return x.get("exchange") or x.get("exchangeName") or ""
+        total_oi = sum(float(x.get("open_interest_usd") or x.get("openInterestUsd") or 0) for x in items)
         lines.append(f"\nOpen Interest: {fmt(total_oi)}")
-        lines.append(f"  Change: 1h {ch1h:+.2f}%  4h {ch4h:+.2f}%  24h {ch24h:+.2f}%")
-        per_ex = [x for x in items if _ex_name(x) != "All"]
-        for x in per_ex[:6]:
-            ex  = _ex_name(x) or "?"
-            oi  = float(x.get("openInterestUsd") or x.get("open_interest_usd") or 0)
+        for x in sorted(items, key=lambda x: float(x.get("open_interest_usd") or x.get("openInterestUsd") or 0), reverse=True)[:6]:
+            ex   = _ex_name(x) or "?"
+            oi   = float(x.get("open_interest_usd") or x.get("openInterestUsd") or 0)
             share = (oi / total_oi * 100) if total_oi else 0
             lines.append(f"  {ex:16} {fmt(oi):>12}  ({share:.1f}%)")
     else:
@@ -775,10 +769,8 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
                 pass
             d = items[0]
             try:
-                long_usd  = float(d.get("aggregatedLongUsd") or d.get("long_liquidation_usd") or
-                                  d.get("long") or 0)
-                short_usd = float(d.get("aggregatedShortUsd") or d.get("short_liquidation_usd") or
-                                  d.get("short") or 0)
+                long_usd  = float(d.get("aggregated_long_liquidation_usd") or d.get("aggregatedLongUsd") or d.get("long_liquidation_usd") or d.get("long") or 0)
+                short_usd = float(d.get("aggregated_short_liquidation_usd") or d.get("aggregatedShortUsd") or d.get("short_liquidation_usd") or d.get("short") or 0)
                 total_usd = long_usd + short_usd
                 ts = d.get("timestamp") or d.get("time") or 0
                 if ts > 1e10:
@@ -835,15 +827,12 @@ def derivatives_anchor(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
             avg = total / count
             parts.append(f"  Funding avg (major): {avg:+.4f}%")
 
-    # OI total
+    # OI total — sum all exchanges (no aggregate row in v4)
     if oi_data and oi_data.get("data"):
         items = oi_data["data"] if isinstance(oi_data["data"], list) else [oi_data["data"]]
-        def _ex_name(x): return x.get("exchangeName") or x.get("exchange") or ""
-        agg = next((x for x in items if _ex_name(x) == "All"), items[0] if items else {})
-        total_oi = float(agg.get("openInterestUsd") or agg.get("open_interest_usd") or 0)
-        ch24 = float(agg.get("h24Change") or agg.get("oichangePercent") or agg.get("open_interest_change_percent_24h") or 0)
+        total_oi = sum(float(x.get("open_interest_usd") or x.get("openInterestUsd") or 0) for x in items)
         if total_oi:
-            parts.append(f"  OI total: ${total_oi/1e9:.2f}B  (24h change: {ch24:+.2f}%)")
+            parts.append(f"  OI total: ${total_oi/1e9:.2f}B")
 
     # Long/short
     if ls_data and ls_data.get("data"):
@@ -1746,18 +1735,12 @@ async def cmd_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if oi_data and oi_data.get("data"):
         items = oi_data["data"]
         items = items if isinstance(items, list) else [items]
-        def _ex_name_oi(x): return x.get("exchangeName") or x.get("exchange") or ""
-        agg = next((x for x in items if _ex_name_oi(x) == "All"), items[0] if items else {})
-        total_oi = float(agg.get("openInterestUsd") or agg.get("open_interest_usd") or 0)
-        ch1h  = float(agg.get("h1OIChangePercent") or agg.get("open_interest_change_percent_1h") or 0)
-        ch4h  = float(agg.get("h4OIChangePercent") or agg.get("open_interest_change_percent_4h") or 0)
-        ch24h = float(agg.get("h24Change") or agg.get("oichangePercent") or agg.get("open_interest_change_percent_24h") or 0)
-        lines.append(f"Total OI: {fmt(total_oi)}")
-        lines.append(f"Change: 1h {ch1h:+.2f}%  4h {ch4h:+.2f}%  24h {ch24h:+.2f}%\n")
-        per_ex = [x for x in items if _ex_name_oi(x) != "All"]
-        for x in per_ex[:10]:
-            ex  = _ex_name_oi(x) or "?"
-            oi  = float(x.get("openInterestUsd") or x.get("open_interest_usd") or 0)
+        def _ex_name_oi(x): return x.get("exchange") or x.get("exchangeName") or ""
+        total_oi = sum(float(x.get("open_interest_usd") or x.get("openInterestUsd") or 0) for x in items)
+        lines.append(f"Total OI: {fmt(total_oi)}\n")
+        for x in sorted(items, key=lambda x: float(x.get("open_interest_usd") or x.get("openInterestUsd") or 0), reverse=True)[:10]:
+            ex   = _ex_name_oi(x) or "?"
+            oi   = float(x.get("open_interest_usd") or x.get("openInterestUsd") or 0)
             share = (oi / total_oi * 100) if total_oi else 0
             lines.append(f"  {ex:16} OI: {fmt(oi):>12}  ({share:.1f}% share)")
     else:
@@ -2069,40 +2052,22 @@ async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"Vol/MCap: {vm:.2f}%  |  vs ATH: {ath_p:.1f}%  (ATH ${ath:,.0f})")
         lines.append("")
 
-    # ETF holdings list — v4: ticker/fundTicker, aum/aum_usd, fundType/fund_type, btcHolding
+    # ETF list — v4 fields: ticker, fund_name, region, market_status, primary_exchange
     if etf_list and etf_list.get("data"):
-        def _is_spot(x):
-            ft = x.get("fundType") or x.get("fund_type") or x.get("marketType") or ""
-            return "spot" in ft.lower() if ft else True  # default include if unknown
-        def _get_aum(x):
-            return float(x.get("aum") or x.get("aum_usd") or x.get("netAssets") or 0)
-        spot = sorted([x for x in etf_list["data"] if _is_spot(x)], key=_get_aum, reverse=True)
-        if not spot:
-            spot = sorted(etf_list["data"], key=_get_aum, reverse=True)
-        if spot:
-            lines.append("BTC SPOT ETF HOLDINGS:")
-            lines.append(f"  {'TICKER':8} {'AUM':>12}  {'BTC HELD':>14}  {'24h BTC':>10}  {'7d BTC':>10}")
-            lines.append("  " + "─"*60)
-            total_btc = 0.0
-            total_aum = 0.0
-            for item in spot[:10]:
-                try:
-                    ticker = item.get("ticker") or item.get("fundTicker") or "?"
-                    aum    = _get_aum(item)
-                    # btcHolding may be at top level or inside asset_details
-                    ad     = item.get("asset_details") or item.get("assetDetails") or {}
-                    btc_h  = float(item.get("btcHolding") or item.get("btc_holding") or
-                                   ad.get("btcHolding") or ad.get("btc_holding") or 0)
-                    chg24  = float(item.get("btcChange24h") or item.get("btc_change_24h") or
-                                   ad.get("btcChange24h") or ad.get("btc_change_24h") or 0)
-                    chg7d  = float(item.get("btcChange7d") or item.get("btc_change_7d") or
-                                   ad.get("btcChange7d") or ad.get("btc_change_7d") or 0)
-                    total_btc += btc_h
-                    total_aum += aum
-                    lines.append(f"  {ticker:8} {fmt(aum):>12}  {btc_h:>14,.1f}  {chg24:>+10.1f}  {chg7d:>+10.1f}")
-                except Exception:
-                    pass
-            lines.append(f"  {'TOTAL':8} {fmt(total_aum):>12}  {total_btc:>14,.1f} BTC")
+        items = etf_list["data"]
+        lines.append("BTC ETF LIST:")
+        lines.append(f"  {'TICKER':8} {'NAME':28} {'EXCHANGE':14} {'STATUS':10} {'REGION'}")
+        lines.append("  " + "─"*72)
+        for item in items[:12]:
+            try:
+                ticker   = item.get("ticker") or "?"
+                name     = (item.get("fund_name") or "")[:26]
+                exchange = (item.get("primary_exchange") or "")[:12]
+                status   = item.get("market_status") or ""
+                region   = item.get("region") or ""
+                lines.append(f"  {ticker:8} {name:28} {exchange:14} {status:10} {region}")
+            except Exception:
+                pass
         lines.append("")
 
     # ETF flow history — v4: flowUsd/flow_usd, timestamp
@@ -2141,7 +2106,7 @@ async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Do NOT write ON-CHAIN CONTEXT or DERIVATIVES sections.\n"
         "Do NOT include a TRADE SETUP section.\n"
         "ETF flows: state the 7-day net total and direction (inflow/outflow). What does the trend imply for institutional conviction?\n"
-        "Top holders: which ETF holds the most BTC? Any notable 24h or 7d changes in holdings?\n"
+        "ETF list: how many ETFs are active? Note any regional patterns.\n"
         "BTC Vol/MCap: state the % and what it implies about institutional desk activity.\n"
         "ATH distance: how much pain are late-cycle ETF buyers currently in?\n"
         "One-line verdict: are conditions favourable or unfavourable for ETF inflows right now?"
