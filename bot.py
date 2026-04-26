@@ -103,7 +103,7 @@ async def tier_gate(update: Update) -> bool:
     contact = f"@{OWNER_USERNAME}" if OWNER_USERNAME else "the bot owner"
     await update.message.reply_text(
         "Tetranomio Pro required ($10/month).\n\n"
-        "Pro unlocks: /cipher  /btc  /derivatives  /defi  /dex\n"
+        "Pro unlocks: /tetra  /btc  /derivatives  /defi  /dex\n"
         "             /yields  /etf  /dominance  /trending\n"
         "             /watchlist  /ask  + automatic alerts\n\n"
         f"To upgrade, DM {contact} with your Telegram ID: "
@@ -918,7 +918,7 @@ PRICE FORMAT: Use exact price from live data only. Never round to approximate va
 SIZING LANGUAGE: Use institutional sizing language — "25% initial allocation", "add 15% at $X", "reduce notional by 30%", not "buy a bit" or "scale in slowly".
 
 INTENT CLASSIFICATION — ALWAYS DO THIS FIRST:
-TYPE A — MARKET REPORT: /cipher /btc /fear /defi + general market questions
+TYPE A — MARKET REPORT: /tetra /btc /fear /defi + general market questions
 TYPE B — COIN ANALYSIS: any ticker or coin name question
 TYPE C — POSITION/ALLOCATION: add / reduce / DCA / take profit / sizing questions
 TYPE D — CONCEPT: explain funding rates / OI / liquidations / on-chain metrics
@@ -1396,7 +1396,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     plan = "OWNER" if u.id == OWNER_ID else ("PRO" if is_pro(u.id) else "FREE")
     if plan in ("PRO", "OWNER"):
         body = (
-            "*Market:*  /cipher  /btc  /dominance  /trending\n"
+            "*Market:*  /tetra  /btc  /dominance  /trending\n"
             "*DeFi:*    /defi  /dex  /yields\n"
             "*Deriv:*   /derivatives  /funding  /oi\n"
             "*Macro:*   /fear  /macro  /etf\n"
@@ -1408,7 +1408,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         body = (
             "*Free:*  /fear  /macro\n\n"
             f"Upgrade to Pro ($10/month) for the full institutional suite:\n"
-            f"/cipher  /btc  /derivatives  /defi  /dex  /yields\n"
+            f"/tetra  /btc  /derivatives  /defi  /dex  /yields\n"
             f"/etf  /dominance  /trending  /watchlist  /ask  + alerts\n\n"
             f"DM {contact} to upgrade  |  /plans to see all features"
         )
@@ -1428,7 +1428,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"*Tetranomio — Institutional Market Intelligence*  |  {plan}\n"
         + free_note + "\n\n"
         "*Market Reports*\n"
-        f"`/cipher`{p} — Full cycle: macro + market + derivatives + allocation signal\n"
+        f"`/tetra`{p} — Full cycle: macro + market + derivatives + allocation signal\n"
         f"`/btc`{p} — BTC institutional brief: all timeframes + full derivatives\n"
         f"`/dominance`{p} — BTC/ETH dominance + capital rotation analysis\n"
         f"`/trending`{p} — Trending + gainers/losers + volume conviction\n\n"
@@ -2375,7 +2375,7 @@ async def cmd_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  Automatic market alerts (price shocks, funding extremes)\n\n"
         "*PRO — $10 / month*\n"
         "  Everything in Free, plus:\n"
-        "  /cipher — Full institutional market report\n"
+        "  /tetra — Full institutional market report\n"
         "  /btc — BTC deep-dive with full derivatives\n"
         "  /defi — TVL + DEX volumes + chain share\n"
         "  /dex — DEX volume rankings (Uniswap, Curve, GMX...)\n"
@@ -2596,7 +2596,7 @@ async def main():
         ("plans",       cmd_plans),
         ("upgrade",     cmd_upgrade),
         ("alerts",      cmd_alerts),
-        ("cipher",      cmd_cipher),
+        ("tetra",       cmd_cipher),
         ("btc",         cmd_btc),
         ("dominance",   cmd_dominance),
         ("trending",    cmd_trending),
@@ -2623,7 +2623,7 @@ async def main():
     async with app:
         await app.initialize()
         await app.bot.set_my_commands([
-            BotCommand("cipher",      "Full institutional report (Pro)"),
+            BotCommand("tetra",       "Full institutional report (Pro)"),
             BotCommand("btc",         "BTC deep dive with full derivatives (Pro)"),
             BotCommand("defi",        "DeFi TVL + DEX volumes (Pro)"),
             BotCommand("dex",         "DEX volume rankings (Pro)"),
