@@ -573,40 +573,52 @@ async def gl_multi(symbol: str = "BTC") -> tuple:
     )
 
 async def gl_debug(symbol: str = "BTC") -> str:
-    """Debug helper: probe CoinGlass endpoints and return status report."""
-    endpoints = [
+    """Debug helper: probe CoinGlass + CoinGecko endpoints and return status report."""
+    lines = [f"API STATUS | {datetime.now(timezone.utc).strftime('%H:%M UTC')}"]
+
+    # ── CoinGecko ──
+    lines.append(f"\nCOINGECKO  key={'SET' if CG_KEY else 'MISSING'}")
+    cg_tests = [
+        ("/global",         {}),
+        ("/coins/markets",  {"vs_currency": "usd", "ids": "bitcoin", "price_change_percentage": "1h,24h,7d"}),
+        ("/search/trending",{}),
+    ]
+    for ep, params in cg_tests:
+        r = await cg(ep, params)
+        if r is None:
+            st = "FAIL — None (401/timeout)"
+        elif isinstance(r, list):
+            st = f"OK — {len(r)} items"
+        elif isinstance(r, dict):
+            st = f"OK — keys: {list(r.keys())[:5]}"
+        else:
+            st = f"UNEXPECTED {type(r).__name__}"
+        lines.append(f"  {ep:30} {st}")
+
+    # ── CoinGlass ──
+    lines.append(f"\nCOINGLASS  key={'SET' if GLASS_KEY else 'MISSING'}  base={GLASS_BASE}")
+    gl_tests = [
         ("/futures/funding-rate/exchange-list",              {"symbol": symbol}),
         ("/futures/open-interest/exchange-list",             {"symbol": symbol}),
-        ("/futures/liquidation/aggregated-history",          {"exchange_list": "Binance", "symbol": "BTC", "interval": "1d", "limit": "2"}),
+        ("/futures/liquidation/aggregated-history",          {"exchange_list": "Binance", "symbol": symbol, "interval": "1d", "limit": "2"}),
         ("/futures/global-long-short-account-ratio/history", {"exchange": "Binance", "symbol": f"{symbol}USDT", "interval": "4h"}),
         ("/etf/bitcoin/flow-history",                        {"limit": "3"}),
         ("/etf/bitcoin/list",                                {}),
         ("/index/bitcoin-dominance",                         {}),
-        ("/futures/funding-rate/history",                    {"exchange": "Binance", "symbol": f"{symbol}USDT", "interval": "1d", "limit": "2"}),
-        ("/futures/open-interest/history",                   {"exchange": "Binance", "symbol": f"{symbol}USDT", "interval": "1d", "limit": "2"}),
     ]
-    lines = [f"API Debug | {symbol} | {datetime.now(timezone.utc).strftime('%H:%M')} UTC"]
-    lines.append(f"Base: {GLASS_BASE}")
-    lines.append(f"Key: {'SET' if GLASS_KEY else 'MISSING — set COINGLASS_API_KEY'}")
-    lines.append("")
-    for ep, params in endpoints:
-        result = await _fetch(f"{GLASS_BASE}{ep}", {"CG-API-KEY": GLASS_KEY}, params)
-        if result is None:
-            status = "FAIL (None — auth error or wrong path)"
-        elif not isinstance(result, dict):
-            status = f"FAIL (unexpected type: {type(result).__name__})"
-        elif result.get("data"):
-            data = result["data"]
-            if isinstance(data, list):
-                first_keys = list(data[0].keys())[:8] if data else []
-                status = f"OK — {len(data)} items | first item keys: {first_keys}"
-            elif isinstance(data, dict):
-                status = f"OK — dict keys: {list(data.keys())[:6]}"
-            else:
-                status = f"OK — data type: {type(data).__name__}"
+    for ep, params in gl_tests:
+        r = await _fetch(f"{GLASS_BASE}{ep}", {"CG-API-KEY": GLASS_KEY}, params)
+        if r is None:
+            st = "FAIL — None (auth/path)"
+        elif not isinstance(r, dict):
+            st = f"UNEXPECTED {type(r).__name__}"
+        elif r.get("data"):
+            d = r["data"]
+            st = f"OK — {len(d)} items, keys: {list(d[0].keys())[:6]}" if isinstance(d, list) and d else f"OK — {type(d).__name__}"
         else:
-            status = f"EMPTY — keys: {list(result.keys())[:5]}, msg: {result.get('msg','')}"
-        lines.append(f"  {ep:45} {status}")
+            st = f"EMPTY — msg='{r.get('msg','')}' code={r.get('code','')}"
+        lines.append(f"  {ep:50} {st}")
+
     return "\n".join(lines)
 
 # ── Data formatters ───────────────────────────────────────────────────────────
