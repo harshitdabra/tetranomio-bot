@@ -1087,12 +1087,20 @@ async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 900) -> str:
     return "Tetranomio: unavailable. Try again."
 
 # ── Send helper ───────────────────────────────────────────────────────────────
+def _fix_markdown(text: str) -> str:
+    """Convert Gemini's **bold** to Telegram's *bold*, remove unsupported markdown."""
+    import re
+    text = re.sub(r'\*\*(.+?)\*\*', r'*\1*', text)  # **x** → *x*
+    text = re.sub(r'#{1,6}\s+(.+)', r'*\1*', text)   # ## Header → *Header*
+    return text
+
 async def send(update: Update, text: str):
     if not text.strip():
         await update.message.reply_text("Tetranomio: no output. Try again.")
         return
+    text = _fix_markdown(text)
     for i in range(0, len(text), 4000):
-        await update.message.reply_text(text[i:i+4000])
+        await update.message.reply_text(text[i:i+4000], parse_mode=ParseMode.MARKDOWN)
 
 async def ack(update: Update, context: ContextTypes.DEFAULT_TYPE, msg: str = "Fetching live data..."):
     await update.message.reply_text(msg)
@@ -1784,10 +1792,10 @@ async def cmd_funding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = (
         "\n".join(lines) + "\n\n"
         f"TYPE A — FUNDING RATE ANALYSIS for {gl_sym}.\n"
-        "State average funding rate and what the level implies for positioning.\n"
+        "State the exact average funding rate and what the level implies for positioning.\n"
         "Which exchanges show the most extreme rates? What does divergence between exchanges mean?\n"
         "Crowded long: longs are paying — shorts have an edge. Crowded short: inverse.\n"
-        "One-line actionable: what does a trader do with this funding structure right now?"
+        "One-line actionable: describe the positioning bias only. Do NOT invent price levels or stop losses — no price data was provided."
     )
     result = await ask_groq(prompt, user.get("custom_instructions",""))
     await send(update, result)
