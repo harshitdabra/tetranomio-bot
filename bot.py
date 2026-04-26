@@ -570,6 +570,7 @@ async def gl_multi(symbol: str = "BTC") -> tuple:
         gl_oi(symbol),
         gl_liquidations(symbol),
         gl_longshort(symbol),
+        gl_oi_history(f"{symbol}USDT", "1d", 2),
     )
 
 async def gl_debug(symbol: str = "BTC") -> str:
@@ -675,7 +676,7 @@ def format_coin_section(c: dict, btc_24h: float = 0) -> str:
         lines.append(f"vs BTC 24h:  {rel:+.2f}pp  ({'OUTPERFORM' if rel > 0 else 'UNDERPERFORM'})")
     return "\n".join(lines)
 
-def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) -> str:
+def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str, oi_hist=None) -> str:
     """
     CoinGlass v4 exact field names (verified from live API):
     funding: data = {symbol, stablecoin_margin_list: [{exchange, funding_rate, funding_rate_interval}]}
@@ -729,7 +730,16 @@ def format_derivatives(funding_data, oi_data, liq_data, ls_data, symbol: str) ->
         items = items if isinstance(items, list) else [items]
         def _ex_name(x): return x.get("exchange") or x.get("exchangeName") or ""
         total_oi = sum(float(x.get("open_interest_usd") or x.get("openInterestUsd") or 0) for x in items)
-        lines.append(f"\nOpen Interest: {fmt(total_oi)}")
+        ch24 = ""
+        if oi_hist and oi_hist.get("data") and len(oi_hist["data"]) >= 2:
+            try:
+                candles = sorted(oi_hist["data"], key=lambda x: x.get("time", 0))
+                prev = float(candles[-2].get("close") or candles[-2].get("c") or 0)
+                if prev:
+                    ch24 = f"  24h: {(total_oi - prev) / prev * 100:+.2f}%"
+            except Exception:
+                pass
+        lines.append(f"\nOpen Interest: {fmt(total_oi)}{ch24}")
         for x in sorted(items, key=lambda x: float(x.get("open_interest_usd") or x.get("openInterestUsd") or 0), reverse=True)[:6]:
             ex   = _ex_name(x) or "?"
             oi   = float(x.get("open_interest_usd") or x.get("openInterestUsd") or 0)
@@ -934,32 +944,39 @@ TYPE G — PORTFOLIO REVIEW: watchlist / multi-asset allocation review
 RESPONSE FORMATS:
 
 TYPE A — MARKET REPORT:
-MACRO REGIME
+*MACRO REGIME*
 [Current risk-on / risk-off / transitional. Fed posture. DXY trend. Equity correlation signal. One number anchors this.]
-MARKET STRUCTURE
+
+*MARKET STRUCTURE*
 [Total MC + 24h change. BTC/ETH price vs key levels. No-man's land or at structure. Exact numbers only.]
-INSTITUTIONAL FLOWS
+
+*INSTITUTIONAL FLOWS*
 [Stablecoin supply direction + implication. ETF flow if available. Dry powder estimate.]
-DERIVATIVES
+
+*DERIVATIVES*
 [Funding rate avg + bias interpretation. OI total + direction. Long/short ratio + crowding risk.]
-SIGNAL SYNTHESIS
+
+*SIGNAL SYNTHESIS*
 Bias: BULLISH / BEARISH / NEUTRAL | Confidence: HIGH / MEDIUM / LOW
-Primary driver: [one specific number from the data]
-Invalidation level: [specific price or macro event]
-POSITION RECOMMENDATION [only if 2+ signals converge — omit if not]
-Asset | Direction | Entry zone | Stop | Target 1 | Target 2 | Conviction: H/M/L
-Thesis: [2 sentences, numbers only, no adjectives]
-ALLOCATION ACTION: [add exposure / reduce notional / hold / avoid / wait for level] — [one-line reason with a number]
+— Primary driver: [one specific number from the data]
+— Invalidation: [specific price or macro event]
+
+*POSITION RECOMMENDATION* [only if 2+ signals converge — omit if not]
+Asset | Direction | Entry | Stop | T1 | T2 | Conviction: H/M/L
+Thesis: [2 sentences, numbers only]
+
+*ALLOCATION ACTION:* [add / reduce / hold / avoid / wait] — [one-line reason with a number]
 
 TYPE B — COIN ANALYSIS:
-[COIN] | [live price] | [date UTC]
-PRICE STRUCTURE: [vs 24h range. vs ATH drawdown %. Key level above and below with exact prices.]
-MOMENTUM: [1h/24h/7d performance. vs BTC relative performance in percentage points.]
-VOLUME QUALITY: [Vol/MCap ratio. Is volume confirming the move or diverging?]
-RISK/REWARD: [Upside to next resistance vs downside to next support. Express as X:1 ratio.]
-DERIVATIVES: [Funding rate — exact number. OI direction. Long/short crowding. If unavailable, state so.]
-ALLOCATION VERDICT: BUILD POSITION / ACCUMULATE AT $X / HOLD / REDUCE NOTIONAL / AVOID
-[If actionable: entry zone, hard stop, target. Sizing: X% initial, Y% on confirmation.]
+*[COIN]* | [live price] | [date UTC]
+
+*PRICE STRUCTURE:* [vs 24h range. vs ATH drawdown %. Key level above and below.]
+*MOMENTUM:* [1h/24h/7d. vs BTC relative performance in percentage points.]
+*VOLUME QUALITY:* [Vol/MCap ratio. Confirming or diverging?]
+*RISK/REWARD:* [Upside vs downside. Express as X:1 ratio.]
+*DERIVATIVES:* [Funding rate exact number. OI direction. Long/short crowding.]
+*ALLOCATION VERDICT:* BUILD / ACCUMULATE AT $X / HOLD / REDUCE / AVOID
+— [entry zone, hard stop, target if actionable]
 
 TYPE C — ALLOCATION BRIEF:
 POSITION ASSESSMENT | [asset] @ [live price] | [date UTC]
@@ -997,7 +1014,15 @@ PRIMARY (drives bias): Funding rate trend | OI change direction | Long/short cro
 CONFIRMING (supports thesis): Vol/MCap ratio | ETF inflow/outflow | BTC dominance inflection | DeFi TVL
 SENTIMENT (context only, never primary): Fear & Greed Index | social volume | search trends
 
-STYLE: Tier-1 institutional morning brief. Bloomberg terminal density. Active voice. Short declarative sentences. Every sentence adds new analytical content. No sentence without a number. No claim without a cited data point. No adjectives that are not quantified."""
+STYLE: Tier-1 institutional morning brief. Bloomberg terminal density. Active voice. Short declarative sentences. Every sentence adds new analytical content. No sentence without a number. No claim without a cited data point. No adjectives that are not quantified.
+
+TELEGRAM FORMATTING — MANDATORY:
+- Every section header must be bold: *MACRO REGIME*, *MARKET STRUCTURE*, *DERIVATIVES*, etc.
+- Blank line between every section.
+- Sub-points use — prefix (not bullets or dashes).
+- Numbers inline with their interpretation on the same line.
+- Max 2 sentences per section paragraph before a line break.
+- Never output a wall of text. Every 2 sentences = new line."""
 
 # ── Groq call ─────────────────────────────────────────────────────────────────
 async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 1500) -> str:
@@ -1103,7 +1128,7 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
             cg_market("bitcoin,ethereum"),
             gl_multi(gl_sym),
         )
-        funding, oi, liq, ls = deriv
+        funding, oi, liq, ls, oi_hist = deriv
 
         coin_section = ""
         btc_24h = 0
@@ -1267,8 +1292,8 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 
     # BTC derivatives
     if fetched.get("btc_deriv"):
-        btc_fund, btc_oi, btc_liq, btc_ls = fetched["btc_deriv"]
-        sections.append(format_derivatives(btc_fund, btc_oi, btc_liq, btc_ls, "BTC"))
+        btc_fund, btc_oi, btc_liq, btc_ls, btc_oi_hist = fetched["btc_deriv"]
+        sections.append(format_derivatives(btc_fund, btc_oi, btc_liq, btc_ls, "BTC", btc_oi_hist))
 
     full_context = "\n\n".join(sections)
 
@@ -1477,7 +1502,7 @@ async def cmd_cipher(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cg("/coins/markets", {"vs_currency":"usd","ids":"tether,usd-coin,dai","order":"market_cap_desc"}),
         gl_multi("BTC"),
     )
-    funding, oi, liq, ls = btc_deriv
+    funding, oi, liq, ls, oi_hist = btc_deriv
 
     # Market table
     mkt_lines = [f"LIVE MARKET | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"]
@@ -1569,7 +1594,7 @@ async def cmd_btc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }),
         gl_multi("BTC"),
     )
-    funding, oi, liq, ls = btc_deriv
+    funding, oi, liq, ls, oi_hist = btc_deriv
 
     # Format BTC data
     btc_lines = [f"BTC FULL DATA | {datetime.now(timezone.utc).strftime('%H:%M')} UTC"]
@@ -1633,7 +1658,7 @@ async def cmd_derivatives(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
     try:
-        funding, oi, liq, ls = await gl_multi(gl_sym)
+        funding, oi, liq, ls, oi_hist = await gl_multi(gl_sym)
 
         # Log what we actually got for debugging
         logger.info(f"Derivatives data for {gl_sym}: "
@@ -1775,7 +1800,7 @@ async def cmd_dominance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gdata, top50, btc_deriv, dom_data = await asyncio.gather(
         cg_global(), cg_top50(), gl_multi("BTC"), gl_btc_dominance()
     )
-    btc_fund, btc_oi, btc_liq, btc_ls = btc_deriv
+    btc_fund, btc_oi, btc_liq, btc_ls, _ = btc_deriv
 
     lines = [f"DOMINANCE & ROTATION | {datetime.now(timezone.utc).strftime('%H:%M')} UTC\n"]
     # CoinGlass real-time BTC dominance — v4 fields: btcDominance or bitcoin_dominance
