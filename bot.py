@@ -576,6 +576,12 @@ async def gl_debug(symbol: str = "BTC") -> str:
     """Debug helper: probe CoinGlass + CoinGecko endpoints and return status report."""
     lines = [f"API STATUS | {datetime.now(timezone.utc).strftime('%H:%M UTC')}"]
 
+    # ── Raw env var check ──
+    lines.append("\nENV VARS (names + lengths, no values):")
+    for name in ["TELEGRAM_BOT_TOKEN", "GROQ_API_KEY", "COINGECKO_API_KEY", "COINGLASS_API_KEY", "ALLOWED_USER_ID"]:
+        val = os.getenv(name, "")
+        lines.append(f"  {name:30} {'SET len='+str(len(val)) if val else 'MISSING'}")
+
     # ── CoinGecko ──
     lines.append(f"\nCOINGECKO  key={'SET' if CG_KEY else 'MISSING'}")
     cg_tests = [
