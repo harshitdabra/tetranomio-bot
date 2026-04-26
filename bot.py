@@ -16,6 +16,7 @@ from aiohttp import web
 from pathlib import Path
 from datetime import datetime, timezone
 from groq import Groq
+import google.generativeai as genai
 from telegram import Update, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -37,6 +38,7 @@ CG_KEY          = os.getenv("COINGECKO_API_KEY", "")
 GLASS_KEY       = os.getenv("COINGLASS_API_KEY", "")
 OWNER_ID        = int(os.getenv("ALLOWED_USER_ID", "1953473977"))
 OWNER_USERNAME  = os.getenv("OWNER_TELEGRAM", "")  # e.g. "harshitdabra" (no @)
+GEMINI_KEY      = os.getenv("GEMINI_API_KEY", "")
 
 CG_BASE         = "https://pro-api.coingecko.com/api/v3"
 GLASS_BASE      = "https://open-api-v4.coinglass.com/api"
@@ -1024,46 +1026,61 @@ TELEGRAM FORMATTING — MANDATORY:
 - Max 2 sentences per section paragraph before a line break.
 - Never output a wall of text. Every 2 sentences = new line."""
 
-# ── Groq call ─────────────────────────────────────────────────────────────────
+# ── AI call — Gemini primary, Groq fallback ───────────────────────────────────
 async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 900) -> str:
-    client = Groq(api_key=GROQ_KEY)
     system = TETRANOMIO_SYSTEM + (f"\n\nANALYST CONTEXT:\n{custom}" if custom.strip() else "")
-    loop = asyncio.get_event_loop()
+    loop   = asyncio.get_event_loop()
 
-    def _sync_call(model: str):
+    # ── 1. Gemini (primary — 1M TPM free) ──
+    if GEMINI_KEY:
+        def _gemini():
+            genai.configure(api_key=GEMINI_KEY)
+            model = genai.GenerativeModel(
+                model_name="gemini-1.5-flash",
+                system_instruction=system,
+                generation_config=genai.GenerationConfig(
+                    max_output_tokens=max_tokens,
+                    temperature=0.15,
+                ),
+            )
+            return model.generate_content(prompt)
+        try:
+            resp = await asyncio.wait_for(loop.run_in_executor(None, _gemini), timeout=50)
+            text = resp.text.strip() if resp.text else ""
+            if text:
+                return text
+        except asyncio.TimeoutError:
+            logger.warning("Gemini timeout, falling back to Groq")
+        except Exception as e:
+            logger.warning(f"Gemini error ({e}), falling back to Groq")
+
+    # ── 2. Groq fallback ──
+    if not GROQ_KEY:
+        return "Tetranomio: no AI key configured."
+    client = Groq(api_key=GROQ_KEY)
+
+    def _groq(model: str):
         return client.chat.completions.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=0.15,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": prompt},
-            ],
+            model=model, max_tokens=max_tokens, temperature=0.15,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user",   "content": prompt}],
         )
 
-    # Primary model with retry on 429, fallback to faster model
-    for attempt, model in enumerate([
-        "llama-3.3-70b-versatile",
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-    ]):
+    for attempt, model in enumerate(["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]):
         try:
-            wait = [0, 8, 0][attempt]
-            if wait:
-                await asyncio.sleep(wait)
+            if attempt:
+                await asyncio.sleep(8)
             resp = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda m=model: _sync_call(m)), timeout=50
+                loop.run_in_executor(None, lambda m=model: _groq(m)), timeout=50
             )
             return resp.choices[0].message.content.strip() or "Tetranomio: empty response."
         except asyncio.TimeoutError:
-            if attempt == 2:
-                return "Tetranomio: timeout. Try again in a moment."
+            if attempt:
+                return "Tetranomio: timeout. Try again."
         except Exception as e:
             err = str(e)
-            if "429" in err:
-                logger.warning(f"Groq 429 on {model} attempt {attempt+1}")
-                if attempt == 2:
-                    return "Rate limit reached. Try again in 30 seconds."
+            if "429" in err and not attempt:
+                logger.warning(f"Groq 429 on {model}, retrying with fallback")
                 continue
             logger.error(f"Groq error: {e}")
             return f"Tetranomio: AI error — {err[:120]}"

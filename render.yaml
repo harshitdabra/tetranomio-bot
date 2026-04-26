@@ -18,3 +18,5 @@ services:
         sync: false
       - key: OWNER_TELEGRAM
         sync: false
+      - key: GEMINI_API_KEY
+        sync: false
