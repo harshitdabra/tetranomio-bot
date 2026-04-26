@@ -1025,14 +1025,14 @@ TELEGRAM FORMATTING — MANDATORY:
 - Never output a wall of text. Every 2 sentences = new line."""
 
 # ── Groq call ─────────────────────────────────────────────────────────────────
-async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 1500) -> str:
+async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 900) -> str:
     client = Groq(api_key=GROQ_KEY)
     system = TETRANOMIO_SYSTEM + (f"\n\nANALYST CONTEXT:\n{custom}" if custom.strip() else "")
     loop = asyncio.get_event_loop()
 
-    def _sync_call():
+    def _sync_call(model: str):
         return client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=model,
             max_tokens=max_tokens,
             temperature=0.15,
             messages=[
@@ -1041,14 +1041,33 @@ async def ask_groq(prompt: str, custom: str = "", max_tokens: int = 1500) -> str
             ],
         )
 
-    try:
-        resp = await asyncio.wait_for(loop.run_in_executor(None, _sync_call), timeout=50)
-        return resp.choices[0].message.content.strip() or "Tetranomio: empty response."
-    except asyncio.TimeoutError:
-        return "Tetranomio: Groq timeout (50s). Try again."
-    except Exception as e:
-        logger.error(f"Groq error: {e}")
-        return f"Tetranomio: AI error — {str(e)[:120]}"
+    # Primary model with retry on 429, fallback to faster model
+    for attempt, model in enumerate([
+        "llama-3.3-70b-versatile",
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+    ]):
+        try:
+            wait = [0, 8, 0][attempt]
+            if wait:
+                await asyncio.sleep(wait)
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda m=model: _sync_call(m)), timeout=50
+            )
+            return resp.choices[0].message.content.strip() or "Tetranomio: empty response."
+        except asyncio.TimeoutError:
+            if attempt == 2:
+                return "Tetranomio: timeout. Try again in a moment."
+        except Exception as e:
+            err = str(e)
+            if "429" in err:
+                logger.warning(f"Groq 429 on {model} attempt {attempt+1}")
+                if attempt == 2:
+                    return "Rate limit reached. Try again in 30 seconds."
+                continue
+            logger.error(f"Groq error: {e}")
+            return f"Tetranomio: AI error — {err[:120]}"
+    return "Tetranomio: unavailable. Try again."
 
 # ── Send helper ───────────────────────────────────────────────────────────────
 async def send(update: Update, text: str):
