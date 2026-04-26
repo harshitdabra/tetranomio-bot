@@ -175,7 +175,9 @@ async def _fetch(url: str, headers: dict, params: dict) -> dict | list | None:
     return None
 
 async def cg(endpoint: str, params: dict = None) -> dict | list | None:
-    return await _fetch(f"{CG_BASE}{endpoint}", {"x-cg-pro-api-key": CG_KEY}, params or {})
+    if CG_KEY:
+        return await _fetch(f"{CG_BASE}{endpoint}", {"x-cg-pro-api-key": CG_KEY}, params or {})
+    return await _fetch(f"https://api.coingecko.com/api/v3{endpoint}", {}, params or {})
 
 async def gl(endpoint: str, params: dict = None) -> dict | list | None:
     """CoinGlass API v4."""
@@ -278,6 +280,8 @@ COINS = {
     "worldcoin":  ("worldcoin-wld",             "WLD"),
     "grt":        ("the-graph",                 "GRT"),
     "shib":       ("shiba-inu",                 "SHIB"),
+    "shiba":      ("shiba-inu",                 "SHIB"),
+    "shibainu":   ("shiba-inu",                 "SHIB"),
     "pepe":       ("pepe",                      "PEPE"),
     "wif":        ("dogwifcoin",                "WIF"),
     "bonk":       ("bonk",                      "BONK"),
