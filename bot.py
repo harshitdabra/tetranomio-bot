@@ -620,7 +620,17 @@ async def gl_debug(symbol: str = "BTC") -> str:
             st = f"UNEXPECTED {type(r).__name__}"
         elif r.get("data"):
             d = r["data"]
-            st = f"OK — {len(d)} items, keys: {list(d[0].keys())[:6]}" if isinstance(d, list) and d else f"OK — {type(d).__name__}"
+            if isinstance(d, list) and d:
+                st = f"OK — {len(d)} items, keys: {list(d[0].keys())[:6]}"
+                # Peek inside stablecoin_margin_list for funding rate
+                if "stablecoin_margin_list" in d[0]:
+                    btc = next((x for x in d if x.get("symbol","").upper() == symbol.upper()), d[0])
+                    inner = btc.get("stablecoin_margin_list") or []
+                    if inner:
+                        st += f"\n    inner keys: {list(inner[0].keys())[:8]}"
+                        st += f"\n    sample: {inner[0]}"
+            else:
+                st = f"OK — {type(d).__name__}"
         else:
             st = f"EMPTY — msg='{r.get('msg','')}' code={r.get('code','')}"
         lines.append(f"  {ep:50} {st}")
