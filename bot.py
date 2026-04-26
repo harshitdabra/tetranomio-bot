@@ -175,9 +175,7 @@ async def _fetch(url: str, headers: dict, params: dict) -> dict | list | None:
     return None
 
 async def cg(endpoint: str, params: dict = None) -> dict | list | None:
-    if CG_KEY:
-        return await _fetch(f"{CG_BASE}{endpoint}", {"x-cg-pro-api-key": CG_KEY}, params or {})
-    return await _fetch(f"https://api.coingecko.com/api/v3{endpoint}", {}, params or {})
+    return await _fetch(f"{CG_BASE}{endpoint}", {"x-cg-pro-api-key": CG_KEY}, params or {})
 
 async def gl(endpoint: str, params: dict = None) -> dict | list | None:
     """CoinGlass API v4."""
